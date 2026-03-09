@@ -123,7 +123,7 @@ curl -sfL https://raw.githubusercontent.com/milvus-io/milvus/master/scripts/stan
 
 ```bash
 ollama serve
-ollama pull qwen2.5:14b   # 推荐中文模型
+ollama pull qwen3.5:9b   # 推荐中文模型
 ```
 
 ### 4. 启动服务
@@ -198,4 +198,4 @@ hits = multi_stage_search(col, "能源管理",
 embedder.py 里改为 `BAAI/bge-small-zh-v1.5`（轻量版，效果稍差）。
 
 **Q: 想指定不同 LLM 模型？**
-设置环境变量：`LLM_MODEL=qwen2.5:7b python app.py`
+设置环境变量：`LLM_MODEL=qwen3.5:9b python app.py`
