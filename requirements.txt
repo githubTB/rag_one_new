@@ -1,0 +1,42 @@
+# ── Web 服务 ──────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart
+httpx                    # 异步调用 Ollama
+
+# ── Embedding & Reranker ──────────────────────────────────────
+sentence-transformers>=2.7.0
+torch                    # sentence-transformers 依赖
+
+# ── 向量库 ────────────────────────────────────────────────────
+pymilvus>=2.4.0
+
+# ── 文档解析 ──────────────────────────────────────────────────
+# PDF
+pymupdf>=1.24.0          # fitz，比 pypdf 快且结构更好
+pdfplumber>=0.10.0       # 专门提取 PDF 表格
+
+# Word
+python-docx>=1.1.0
+
+# Excel
+openpyxl>=3.1.0
+
+# ── OCR（二选一，推荐 PaddleOCR 中文效果好）─────────────────
+# PaddleOCR（中文首选）
+paddlepaddle             # CPU 版，GPU 改 paddlepaddle-gpu
+paddleocr>=2.8.0
+
+# Tesseract（备选，轻量）
+# pytesseract
+# Pillow
+
+# ── LangChain（保留兼容层）────────────────────────────────────
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-huggingface>=0.0.3
+
+# ── 工具 ──────────────────────────────────────────────────────
+python-dotenv
+loguru                   # 比 logging 好用
+pydantic>=2.0.0

@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG One - 智能文档问答系统</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#3b82f6',
+                        secondary: '#6b7280',
+                        success: '#10b981',
+                        danger: '#ef4444',
+                    },
+                },
+            }
+        }
+    </script>
+    <style type="text/tailwindcss">
+        @layer utilities {
+            .content-auto {
+                content-visibility: auto;
+            }
+            .scrollbar-thin {
+                scrollbar-width: thin;
+            }
+            .scrollbar-thumb-rounded {
+                scrollbar-color: rgba(156, 163, 175, 0.5) transparent;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <!-- 导航栏 -->
+    <nav class="bg-white shadow-md">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16">
+                <div class="flex items-center">
+                    <div class="flex-shrink-0 flex items-center">
+                        <i class="fa fa-search text-2xl text-primary mr-2"></i>
+                        <span class="text-xl font-bold text-gray-900">RAG One</span>
+                    </div>
+                </div>
+                <div class="flex items-center">
+                    <span class="text-sm text-gray-500">智能文档问答系统</span>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <!-- 左侧面板：上传和处理 -->
+            <div class="lg:col-span-1">
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <h2 class="text-lg font-semibold mb-4 flex items-center">
+                        <i class="fa fa-upload mr-2 text-primary"></i>
+                        文档管理
+                    </h2>
+                    
+                    <!-- 文件上传 -->
+                    <div class="mb-6">
+                        <label for="file-upload" class="block text-sm font-medium text-gray-700 mb-2">
+                            上传文档
+                        </label>
+                        <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-primary transition-colors">
+                            <input id="file-upload" type="file" multiple class="hidden" accept=".pdf,.docx,.txt,.jpg,.jpeg,.png,.gif,.bmp">
+                            <label for="file-upload" class="cursor-pointer">
+                                <i class="fa fa-cloud-upload text-4xl text-gray-400 mb-2"></i>
+                                <p class="text-sm text-gray-600">点击或拖拽文件到此处上传</p>
+                                <p class="text-xs text-gray-500 mt-1">支持 PDF, DOCX, TXT, JPG, PNG, GIF, BMP 格式</p>
+                            </label>
+                        </div>
+                        <div id="file-list" class="mt-3 space-y-1 text-sm text-gray-600"></div>
+                    </div>
+
+                    <!-- 向量存储配置 -->
+                    <div class="mb-4">
+                        <h3 class="text-sm font-medium text-gray-700 mb-2">向量存储配置</h3>
+                        <div class="space-y-2">
+                            <div class="flex items-center space-x-2">
+                                <label for="vector-store-type" class="text-sm text-gray-600 w-24">存储类型:</label>
+                                <select id="vector-store-type" class="flex-1 border border-gray-300 rounded-md py-1 px-2 text-sm">
+                                <option value="milvus" selected>Milvus</option>
+                                <option value="faiss">FAISS</option>
+                            </select>
+                            </div>
+                            
+                            <div id="milvus-config" class="space-y-2 ml-28">
+                                <div class="flex items-center space-x-2">
+                                    <label for="milvus-host" class="text-sm text-gray-600 w-20">主机:</label>
+                                    <input type="text" id="milvus-host" value="localhost" 
+                                           class="flex-1 border border-gray-300 rounded-md py-1 px-2 text-sm">
+                                </div>
+                                <div class="flex items-center space-x-2">
+                                    <label for="milvus-port" class="text-sm text-gray-600 w-20">端口:</label>
+                                    <input type="text" id="milvus-port" value="19530" 
+                                           class="flex-1 border border-gray-300 rounded-md py-1 px-2 text-sm">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 按钮组 -->
+                    <div class="space-y-3">
+                        <button id="process-btn" class="w-full bg-primary hover:bg-primary/90 text-white font-medium py-2 px-4 rounded-lg transition-colors flex items-center justify-center">
+                            <i class="fa fa-cog mr-2"></i>
+                            处理文档
+                        </button>
+                        <button id="clear-btn" class="w-full bg-gray-200 hover:bg-gray-300 text-gray-700 font-medium py-2 px-4 rounded-lg transition-colors flex items-center justify-center">
+                            <i class="fa fa-trash mr-2"></i>
+                            清空文件
+                        </button>
+                    </div>
+
+                    <!-- 状态信息 -->
+                    <div id="status" class="mt-6 p-3 bg-gray-50 rounded-lg text-sm text-gray-600 hidden">
+                        <i class="fa fa-info-circle mr-1"></i>
+                        <span id="status-text"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 右侧面板：查询和结果 -->
+            <div class="lg:col-span-2">
+                <!-- 查询区域 -->
+                <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                    <h2 class="text-lg font-semibold mb-4 flex items-center">
+                        <i class="fa fa-question-circle mr-2 text-primary"></i>
+                        智能问答
+                    </h2>
+                    <div class="flex gap-3">
+                        <input type="text" id="query-input" placeholder="请输入您的问题..." 
+                               class="flex-1 border border-gray-300 rounded-lg py-2 px-4 focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary">
+                        <button id="search-btn" class="bg-primary hover:bg-primary/90 text-white font-medium py-2 px-6 rounded-lg transition-colors flex items-center">
+                            <i class="fa fa-search mr-1"></i>
+                            搜索
+                        </button>
+                    </div>
+                    <div class="flex items-center mt-3 text-sm text-gray-500">
+                        <label for="top-k" class="mr-2">返回结果数：</label>
+                        <select id="top-k" class="border border-gray-300 rounded-md py-1 px-2 text-sm">
+                            <option value="3">3</option>
+                            <option value="5" selected>5</option>
+                            <option value="10">10</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- 结果展示 -->
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <h2 class="text-lg font-semibold mb-4 flex items-center">
+                        <i class="fa fa-file-text-o mr-2 text-primary"></i>
+                        搜索结果
+                    </h2>
+                    
+                    <!-- 回答区域 -->
+                    <div id="answer-section" class="mb-6 p-4 bg-blue-50 rounded-lg border border-blue-100 hidden">
+                        <div class="flex items-start">
+                            <div class="flex-shrink-0 h-8 w-8 rounded-full bg-primary flex items-center justify-center text-white">
+                                <i class="fa fa-robot"></i>
+                            </div>
+                            <div class="ml-3 flex-1">
+                                <h3 class="text-sm font-medium text-gray-900 mb-1">AI 回答</h3>
+                                <div id="answer" class="text-gray-700"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 相关文档 -->
+                    <div id="results-section" class="space-y-4">
+                        <p class="text-center text-gray-500 py-8">
+                            <i class="fa fa-search text-4xl mb-2 block opacity-20"></i>
+                            请上传文档并处理后进行查询
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- 页脚 -->
+    <footer class="bg-white border-t border-gray-200 mt-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+            <p class="text-center text-sm text-gray-500">
+                © 2024 RAG One. 基于向量检索和大语言模型的智能问答系统。
+            </p>
+        </div>
+    </footer>
+
+    <script>
+        // 全局变量
+        let uploadedFiles = [];
+
+        // DOM 元素
+        const fileUpload = document.getElementById('file-upload');
+        const fileList = document.getElementById('file-list');
+        const processBtn = document.getElementById('process-btn');
+        const clearBtn = document.getElementById('clear-btn');
+        const status = document.getElementById('status');
+        const statusText = document.getElementById('status-text');
+        const queryInput = document.getElementById('query-input');
+        const searchBtn = document.getElementById('search-btn');
+        const topKSelect = document.getElementById('top-k');
+        const resultsSection = document.getElementById('results-section');
+        const answerSection = document.getElementById('answer-section');
+        const answer = document.getElementById('answer');
+
+        // 显示状态信息
+        function showStatus(message, type = 'info') {
+            status.className = `mt-6 p-3 rounded-lg text-sm transition-all duration-300`;
+            statusText.textContent = message;
+            
+            if (type === 'success') {
+                status.className += ' bg-green-50 text-green-700 border border-green-200';
+            } else if (type === 'error') {
+                status.className += ' bg-red-50 text-red-700 border border-red-200';
+            } else if (type === 'warning') {
+                status.className += ' bg-yellow-50 text-yellow-700 border border-yellow-200';
+            } else {
+                status.className += ' bg-gray-50 text-gray-600 border border-gray-200';
+            }
+            
+            status.classList.remove('hidden');
+            
+            // 3秒后自动隐藏（error/warning 延长到5秒）
+            const delay = (type === 'error' || type === 'warning') ? 5000 : 3000;
+            setTimeout(() => {
+                status.classList.add('opacity-0');
+                setTimeout(() => status.classList.add('hidden'), 300);
+            }, delay);
+        }
+
+        // 文件上传处理
+        fileUpload.addEventListener('change', (e) => {
+            const files = Array.from(e.target.files);
+            uploadedFiles = [...uploadedFiles, ...files];
+            
+            // 更新文件列表
+            fileList.innerHTML = '';
+            uploadedFiles.forEach((file, index) => {
+                const fileItem = document.createElement('div');
+                fileItem.className = 'flex items-center justify-between p-2 bg-gray-50 rounded';
+                fileItem.innerHTML = `
+                    <div class="flex items-center">
+                        <i class="fa fa-file mr-2 text-gray-500"></i>
+                        <span class="text-sm truncate max-w-[200px]">${file.name}</span>
+                    </div>
+                    <button type="button" class="text-red-500 hover:text-red-700 text-xs" onclick="removeFile(${index})">
+                        <i class="fa fa-times"></i>
+                    </button>
+                `;
+                fileList.appendChild(fileItem);
+            });
+        });
+
+        // 移除文件
+        window.removeFile = function(index) {
+            uploadedFiles.splice(index, 1);
+            
+            // 更新文件列表
+            fileList.innerHTML = '';
+            uploadedFiles.forEach((file, idx) => {
+                const fileItem = document.createElement('div');
+                fileItem.className = 'flex items-center justify-between p-2 bg-gray-50 rounded';
+                fileItem.innerHTML = `
+                    <div class="flex items-center">
+                        <i class="fa fa-file mr-2 text-gray-500"></i>
+                        <span class="text-sm truncate max-w-[200px]">${file.name}</span>
+                    </div>
+                    <button type="button" class="text-red-500 hover:text-red-700 text-xs" onclick="removeFile(${idx})">
+                        <i class="fa fa-times"></i>
+                    </button>
+                `;
+                fileList.appendChild(fileItem);
+            });
+        };
+
+        // 处理文档
+        processBtn.addEventListener('click', async () => {
+            if (uploadedFiles.length === 0) {
+                showStatus('请先上传文档', 'error');
+                return;
+            }
+
+            // 显示加载状态
+            processBtn.disabled = true;
+            processBtn.innerHTML = '<i class="fa fa-spinner fa-spin mr-2"></i> 处理中...';
+
+            try {
+                // 上传并处理文件（带 Milvus 配置）
+                const formData = new FormData();
+                uploadedFiles.forEach(file => {
+                    formData.append('files', file);
+                });
+
+                // 附带前端配置的 Milvus 参数
+                const storeType = document.getElementById('vector-store-type').value;
+                if (storeType === 'milvus') {
+                    formData.append('milvus_host', document.getElementById('milvus-host').value);
+                    formData.append('milvus_port', document.getElementById('milvus-port').value);
+                }
+
+                const response = await fetch('/api/ingest', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.detail || `服务器错误 (${response.status})`);
+                }
+
+                const result = await response.json();
+                
+                // 统计处理结果
+                const successItems = result.results.filter(r => r.status === 'success');
+                const skippedItems = result.results.filter(r => r.status === 'skipped');
+                const failedItems  = result.results.filter(r => r.status === 'failed');
+
+                let msg = '';
+                if (successItems.length > 0) {
+                    const totalChunks = successItems.reduce((s, r) => s + (r.chunk_count || 0), 0);
+                    msg += `✅ ${successItems.length} 个文件入库成功（共 ${totalChunks} 个 chunk）`;
+                }
+                if (skippedItems.length > 0) msg += `　⏭ ${skippedItems.length} 个重复跳过`;
+                if (failedItems.length  > 0) msg += `　❌ ${failedItems.length} 个失败`;
+
+                const statusType = failedItems.length > 0 && successItems.length === 0
+                    ? 'error' : successItems.length > 0 ? 'success' : 'warning';
+                showStatus(msg || '无文件处理', statusType);
+
+                // 失败详情打印到控制台方便调试
+                failedItems.forEach(r => console.warn(`[ingest fail] ${r.file}: ${r.reason}`));
+
+            } catch (error) {
+                showStatus(`处理失败：${error.message}`, 'error');
+                console.error('[ingest error]', error);
+            } finally {
+                // 恢复按钮状态
+                processBtn.disabled = false;
+                processBtn.innerHTML = '<i class="fa fa-cog mr-2"></i> 处理文档';
+            }
+        });
+
+        // 向量存储类型切换
+        document.getElementById('vector-store-type').addEventListener('change', (e) => {
+            const milvusConfig = document.getElementById('milvus-config');
+            if (e.target.value === 'milvus') {
+                milvusConfig.style.display = 'block';
+            } else {
+                milvusConfig.style.display = 'none';
+            }
+        });
+
+        // 清空文件
+        clearBtn.addEventListener('click', async () => {
+            if (!confirm('确定要从知识库中清除所有文件吗？此操作不可撤销。')) return;
+
+            clearBtn.disabled = true;
+            clearBtn.innerHTML = '<i class="fa fa-spinner fa-spin mr-2"></i> 清空中...';
+
+            try {
+                const filesResponse = await fetch('/api/files');
+                if (!filesResponse.ok) throw new Error('获取文件列表失败');
+                
+                const filesData = await filesResponse.json();
+                const files = filesData.files || [];
+
+                if (files.length === 0) {
+                    showStatus('知识库中暂无文件', 'info');
+                    return;
+                }
+
+                let failCount = 0;
+                for (const file of files) {
+                    const deleteResponse = await fetch(
+                        `/api/files/${encodeURIComponent(file.file_name)}`,
+                        { method: 'DELETE' }
+                    );
+                    if (!deleteResponse.ok) {
+                        console.warn(`删除失败: ${file.file_name}`);
+                        failCount++;
+                    }
+                }
+                
+                uploadedFiles = [];
+                fileList.innerHTML = '';
+                showStatus(
+                    failCount > 0
+                        ? `清空完成，${failCount} 个文件删除失败`
+                        : `已清空 ${files.length} 个文件`,
+                    failCount > 0 ? 'warning' : 'success'
+                );
+            } catch (error) {
+                showStatus(`清空失败：${error.message}`, 'error');
+            } finally {
+                clearBtn.disabled = false;
+                clearBtn.innerHTML = '<i class="fa fa-trash mr-2"></i> 清空文件';
+            }
+        });
+
+        // 搜索处理
+        async function handleSearch() {
+            const query = queryInput.value.trim();
+            if (!query) {
+                showStatus('请输入查询内容', 'error');
+                return;
+            }
+
+            const topK = parseInt(topKSelect.value);
+
+            // 显示加载状态
+            searchBtn.disabled = true;
+            searchBtn.innerHTML = '<i class="fa fa-spinner fa-spin mr-1"></i> 搜索中...';
+            resultsSection.innerHTML = '<p class="text-center text-gray-500 py-8"><i class="fa fa-spinner fa-spin text-2xl"></i> 搜索中...</p>';
+            answerSection.classList.add('hidden');
+
+            try {
+                // 调用查询API
+                const response = await fetch(`/api/query?q=${encodeURIComponent(query)}&top_k=${topK}`);
+
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.detail || '搜索失败');
+                }
+
+                const result = await response.json();
+
+                // 显示回答
+                answer.textContent = result.answer;
+                answerSection.classList.remove('hidden');
+
+                // 如果没有AI生成回答，显示提示
+                if (!result.llm_available) {
+                    showStatus('AI生成回答功能暂时不可用，将显示检索结果', 'warning');
+                }
+
+                // 显示相关文档
+                resultsSection.innerHTML = '';
+                result.citations.forEach((citation, index) => {
+                    const resultItem = document.createElement('div');
+                    resultItem.className = 'border border-gray-200 rounded-lg p-4 hover:shadow-sm transition-shadow';
+                    resultItem.innerHTML = `
+                        <div class="flex items-start">
+                            <div class="flex-shrink-0 h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center text-primary">
+                                <span class="text-sm font-medium">${index + 1}</span>
+                            </div>
+                            <div class="ml-3 flex-1">
+                                <div class="text-sm text-gray-500 mb-1">
+                                    <i class="fa fa-file-o mr-1"></i>
+                                    ${citation.file_name} 第${citation.page}页
+                                    ${citation.heading_path ? ` / ${citation.heading_path}` : ''}
+                                </div>
+                                <div class="text-gray-700 text-sm max-h-32 overflow-y-auto scrollbar-thin scrollbar-thumb-rounded">
+                                    ${citation.text_snippet.replace(/\n/g, '<br>')}
+                                </div>
+                                <div class="text-xs text-gray-400 mt-1">
+                                    相关性: ${(citation.score * 100).toFixed(1)}%
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                    resultsSection.appendChild(resultItem);
+                });
+            } catch (error) {
+                resultsSection.innerHTML = `<p class="text-center text-red-500 py-8">搜索失败：${error.message}</p>`;
+                
+                // 检查是否是Ollama连接问题
+                if (error.message.includes('11434') || error.message.includes('Ollama')) {
+                    const ollamaErrorDiv = document.createElement('div');
+                    ollamaErrorDiv.className = 'bg-yellow-50 border border-yellow-200 rounded-lg p-4 mt-4';
+                    ollamaErrorDiv.innerHTML = `
+                        <div class="flex items-start">
+                            <div class="flex-shrink-0 h-6 w-6 rounded-full bg-yellow-500 flex items-center justify-center text-white text-xs font-bold">
+                                !
+                            </div>
+                            <div class="ml-3">
+                                <h3 class="text-sm font-medium text-yellow-800">Ollama服务不可用</h3>
+                                <p class="text-sm text-yellow-700 mt-1">
+                                    请检查Ollama服务是否正常运行。您可以尝试以下解决方法：<br>
+                                    1. 确保Ollama已正确安装<br>
+                                    2. 尝试重启Ollama服务：<code class="bg-gray-100 px-1 rounded">ollama serve</code><br>
+                                    3. 检查是否有防火墙或网络限制<br>
+                                    <br>
+                                    系统将继续显示检索结果，仅AI生成回答功能不可用。
+                                </p>
+                            </div>
+                        </div>
+                    `;
+                    resultsSection.appendChild(ollamaErrorDiv);
+                }
+            } finally {
+                // 恢复按钮状态
+                searchBtn.disabled = false;
+                searchBtn.innerHTML = '<i class="fa fa-search mr-1"></i> 搜索';
+            }
+        }
+
+        // 搜索按钮点击
+        searchBtn.addEventListener('click', handleSearch);
+
+        // 回车搜索
+        queryInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                handleSearch();
+            }
+        });
+    </script>
+</body>
+</html>
