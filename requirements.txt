@@ -2,41 +2,34 @@
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-multipart
-httpx                    # 异步调用 Ollama
+httpx                       # 异步调用 Ollama
 
-# ── Embedding & Reranker ──────────────────────────────────────
+# ── Embedding ────────────────────────────────────────────────
 sentence-transformers>=2.7.0
-torch                    # sentence-transformers 依赖
+torch                       # sentence-transformers 依赖
 
 # ── 向量库 ────────────────────────────────────────────────────
 pymilvus>=2.4.0
 
 # ── 文档解析 ──────────────────────────────────────────────────
-# PDF
-pymupdf>=1.24.0          # fitz，比 pypdf 快且结构更好
-pdfplumber>=0.10.0       # 专门提取 PDF 表格
+pymupdf>=1.24.0             # PDF 解析（比 pypdf 结构更完整）
+pdfplumber>=0.10.0          # PDF 表格提取
+python-docx>=1.1.0          # Word 文档
+openpyxl>=3.1.0             # Excel 文档
 
-# Word
-python-docx>=1.1.0
+# ── OCR（二选一，推荐 PaddleOCR）──────────────────────────────
+# PaddleOCR（中文首选）：
+#   pip install paddlepaddle paddleocr
+#
+# Tesseract（轻量备选）：
+#   apt-get install tesseract-ocr tesseract-ocr-chi-sim
+#   pip install pytesseract Pillow
 
-# Excel
-openpyxl>=3.1.0
+Pillow                      # 图像处理（OCR 预处理必需）
 
-# ── OCR（二选一，推荐 PaddleOCR 中文效果好）─────────────────
-# PaddleOCR（中文首选）
-paddlepaddle             # CPU 版，GPU 改 paddlepaddle-gpu
-paddleocr>=2.8.0
-
-# Tesseract（备选，轻量）
-# pytesseract
-# Pillow
-
-# ── LangChain（保留兼容层）────────────────────────────────────
-langchain>=0.2.0
-langchain-community>=0.2.0
-langchain-huggingface>=0.0.3
+# ── LangChain（仅保留 Chunk.to_langchain_doc 兼容层）──────────
+langchain-core>=0.2.0
 
 # ── 工具 ──────────────────────────────────────────────────────
-python-dotenv
-loguru                   # 比 logging 好用
 pydantic>=2.0.0
+python-dotenv
