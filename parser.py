@@ -350,6 +350,7 @@ def _paddle_result_to_text(results) -> str:
     """
     把新版 OCRResult 转成有结构的文本。
     利用 rec_boxes 的 Y 坐标把文字分组为行，再按 X 排序还原列顺序。
+    对于月度表格，自动补全 OCR 漏检的月份列。
     """
     for res in results:
         try:
@@ -362,7 +363,7 @@ def _paddle_result_to_text(results) -> str:
             if not boxes or len(boxes) != len(texts):
                 return "\n".join(t for t in texts if t.strip())
 
-            # 按 Y 中心分组（同一行的 Y 中心差距 < 15px）
+            # 按 Y 中心分组
             items = sorted(zip(boxes, texts), key=lambda x: (x[0][1] + x[0][3]) / 2)
             rows = []
             current_row = [items[0]]
@@ -379,14 +380,47 @@ def _paddle_result_to_text(results) -> str:
             rows.append(current_row)
 
             # 每行内按 X 排序
-            lines = []
             for row in rows:
                 row.sort(key=lambda x: x[0][0])
-                lines.append("  ".join(t for _, t in row if t.strip()))
 
-            return "\n".join(l for l in lines if l.strip())
+            # ── 检测并补全漏检的月份列 ──────────────────────────
+            # 判断：第一列 x 坐标 > 60（月份文字应该在最左侧 x<60）
+            # 且存在以 "月" 结尾的行标识
+            MONTH_LABELS = [
+                "2019年12月",
+                "1月","2月","3月","4月","5月","6月",
+                "7月","8月","9月","10月","11月","12月",
+                "当年累计支出", "累计均价",
+            ]
+            # 检查每行第一个元素的 x 坐标，如果都 > 60 说明月份列漏检了
+            # 跳过 rows[3]（2019年12月，x=0 正常），从 rows[4] 开始检测
+            data_rows = rows[3:]        # 所有数据行（含合计）
+            check_rows = rows[4:16]     # 只检查 1月~12月 这12行
+            first_xs = [row[0][0][0] for row in check_rows if row]
+            need_month_patch = (
+                len(check_rows) >= 10 and
+                sum(1 for x in first_xs if x > 60) >= len(first_xs) * 0.8 and
+                not any("月" in row[0][1] for row in check_rows if row)
+            )
+
+            lines = []
+            month_idx = 0
+            MONTH_DATA_LABELS = ["1月","2月","3月","4月","5月","6月",
+                                  "7月","8月","9月","10月","11月","12月",
+                                  "当年累计支出", "累计均价"]
+            for i, row in enumerate(rows):
+                cells = [t for _, t in row]
+                # i>=4：跳过标题(0)、表头(1,2)、2019年12月(3)，从1月开始补
+                if need_month_patch and i >= 4 and month_idx < len(MONTH_DATA_LABELS):
+                    cells = [MONTH_DATA_LABELS[month_idx]] + cells
+                    month_idx += 1
+                lines.append("  ".join(c for c in cells if c.strip()))
+
+            result_text = "\n".join(l for l in lines if l.strip())
+            print(f"    📋 _paddle_result_to_text 输出前3行: {result_text.splitlines()[:3]}")
+            return result_text
+
         except Exception:
-            # 降级：直接拼接
             try:
                 texts = res.json.get("res", {}).get("rec_texts", [])
                 return "\n".join(t for t in texts if t.strip())
@@ -413,7 +447,18 @@ def _run_paddle(img_bytes: bytes) -> str:
             raise RuntimeError(f"PaddleOCR 初始化失败: {e}") from e
 
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-        f.write(img_bytes)
+        # 压缩到 3000px 以内，避免 Paddle 自动缩放影响识别精度
+        try:
+            img = Image.open(io.BytesIO(img_bytes))
+            w, h = img.size
+            max_px = 3000
+            if max(w, h) > max_px:
+                scale = max_px / max(w, h)
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                print(f"    🖼  压缩图片: {w}x{h} → {img.size[0]}x{img.size[1]}")
+            img.save(f.name, format="JPEG", quality=95)
+        except Exception:
+            f.write(img_bytes)
         tmp = f.name
     try:
         results = list(_paddle_instance.predict(tmp))
@@ -860,9 +905,8 @@ def parse_image(file_path: str) -> list[Chunk]:
     cleaned = clean_text_table(text) if _is_table_text(text) else clean_text(text)
 
     if _is_table_text(text):
-        # 表格图片：整体作为一块，保留完整行列结构，确保所有关键词都在同一向量里
         print(f"    📊 检测到表格图片，整体入库（不切片）")
-        print(f"    📝 识别内容预览（前500字）:\n{cleaned[:500]}")
+        print(f"    📝 完整识别内容:\n{cleaned}\n    ── 内容结束 ──")
         texts = [cleaned]
     else:
         texts = smart_chunk_text(cleaned)

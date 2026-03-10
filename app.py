@@ -1,9 +1,9 @@
 """
-app.py — RAG 知识库 API（基于 qwen3.5:9b）
+app.py — RAG 知识库 API（基于 qwen3.5:2b）
 
 接口：
   POST /api/ingest          上传文件 → 解析 → 向量化 → 入库（自动去重）
-  GET  /api/query           向量检索 + qwen3.5:9b 生成带来源标注的答案
+  GET  /api/query           向量检索 + qwen3.5:2b 生成带来源标注的答案
   GET  /api/search          纯向量检索（不走 LLM）
   GET  /api/files           已入库文件列表
   DELETE /api/files/{name}  删除文件
@@ -47,7 +47,7 @@ DB_PATH     = os.getenv("DB_PATH",     "rag_meta.db")
 MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 OLLAMA_URL  = os.getenv("OLLAMA_URL",  "http://localhost:11434")
-LLM_MODEL   = os.getenv("LLM_MODEL",   "qwen3.5:9b")   # ← 主力模型
+LLM_MODEL   = os.getenv("LLM_MODEL",   "qwen3.5:2b")   # ← 主力模型
 COLLECTION  = os.getenv("COLLECTION",  "rag_docs")
 
 # LLM 生成参数
@@ -167,7 +167,7 @@ def _build_prompt(query: str, hits: list[dict]) -> str:
 
 
 async def _call_ollama(prompt: str) -> str:
-    """调用 Ollama（qwen3.5:9b）生成答案"""
+    """调用 Ollama（qwen3.5:2b）生成答案"""
     import httpx
     payload = {
         "model":  LLM_MODEL,
@@ -288,7 +288,7 @@ async def query(
     file_name: Optional[str] = Query(None, description="限定文件名检索"),
 ):
     """
-    RAG 问答：向量检索 → 构建 Prompt → qwen3.5:9b 生成答案
+    RAG 问答：向量检索 → 构建 Prompt → qwen3.5:2b 生成答案
     返回答案 + 结构化 citations
     """
     _ensure_milvus()
@@ -302,7 +302,7 @@ async def query(
             citations=[], llm_available=False
         )
 
-    # 调用 qwen3.5:9b
+    # 调用 qwen3.5:2b
     llm_ok = False
     answer = ""
     try:
