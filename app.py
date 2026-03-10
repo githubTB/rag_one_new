@@ -11,6 +11,15 @@ app.py — RAG 知识库 API（基于 qwen3.5:9b）
 """
 
 import os
+import warnings
+
+# 关闭 PaddleOCR 启动时的联网模型源检查（加速启动，离线也能用）
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+
+# 过滤 requests/urllib3 版本不匹配的无害警告
+warnings.filterwarnings("ignore", message="urllib3", category=Warning)
+warnings.filterwarnings("ignore", message="chardet", category=Warning)
+
 import shutil
 import traceback
 import logging
@@ -238,7 +247,16 @@ async def ingest_files(
                 "file":        upload.filename,
                 "status":      "success",
                 "chunk_count": len(chunks),
-                "types":       list({c.block_type for c in chunks})
+                "types":       list({c.block_type for c in chunks}),
+                "chunks":      [
+                    {
+                        "index": c.chunk_index,
+                        "type":  c.block_type,
+                        "page":  c.page,
+                        "text":  c.text,   # 完整内容
+                    }
+                    for c in chunks
+                ],
             })
 
         except OCRUnavailableError as e:

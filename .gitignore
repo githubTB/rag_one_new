@@ -12,6 +12,7 @@
 .paddlex/
 .paddle/
 .paddleocr/
+.paddle_cache/
 
 # ===== 模型 & 数据文件 =====
 models/
@@ -30,6 +31,7 @@ uploaded_files/
 
 # ===== 缓存 =====
 .cache/
+.claude/
 __pycache__/
 *.py[codz]
 *$py.class

@@ -47,28 +47,79 @@ except ImportError:
     HAS_OPENPYXL = False
     print("⚠️  openpyxl 未安装: pip install openpyxl")
 
+# ── OCR 引擎配置 ─────────────────────────────────────────────
+# OCR_ENGINES: 逗号分隔的引擎名，按顺序尝试第一个可用的
+# 可选值: paddle, tesseract, llm
+# 示例: OCR_ENGINES=paddle,tesseract   （不用 LLM，传统引擎优先）
+#        OCR_ENGINES=llm,paddle         （LLM 优先，Paddle 兜底）
+#        OCR_ENGINES=tesseract          （只用 Tesseract）
+_OCR_ENGINE_ORDER = [
+    e.strip().lower()
+    for e in os.environ.get("OCR_ENGINES", "paddle,tesseract,llm").split(",")
+    if e.strip()
+]
+
+# ── LLM Vision ───────────────────────────────────────────────
+import base64 as _base64
+import urllib.request as _urllib_req
+import json as _json
+
+_OLLAMA_URL   = os.environ.get("OLLAMA_URL",  "http://localhost:11434")
+_VISION_MODEL = os.environ.get("LLM_MODEL",   "qwen3.5:9b")
+_LLM_OCR_TIMEOUT = int(os.environ.get("LLM_OCR_TIMEOUT", "60"))
+_LLM_OCR_MAX_PX  = int(os.environ.get("LLM_OCR_MAX_PX",  "1024"))
+
+def _check_llm_vision() -> bool:
+    if "llm" not in _OCR_ENGINE_ORDER:
+        return False
+    try:
+        with _urllib_req.urlopen(f"{_OLLAMA_URL}/api/tags", timeout=3) as r:
+            data = _json.loads(r.read())
+        names = [m.get("name", "") for m in data.get("models", [])]
+        return any(_VISION_MODEL.split(":")[0] in n for n in names)
+    except Exception:
+        return False
+
+HAS_LLM_VISION = _check_llm_vision()
+
 # ── PaddleOCR ────────────────────────────────────────────────
-try:
-    from paddleocr import PaddleOCR
-    _paddle_instance = None
-    HAS_PADDLE = True
-except Exception:
+import warnings as _warnings
+_warnings.filterwarnings("ignore", category=Warning, module="requests")
+_warnings.filterwarnings("ignore", message=".*urllib3.*")
+_warnings.filterwarnings("ignore", message=".*chardet.*")
+
+# PaddleOCR 模型缓存目录：默认跟随系统（~/.paddlex），可通过 PADDLE_CACHE_DIR 自定义
+# 注意：PaddleX 部分路径硬编码，强制重定向无效，保持默认即可
+_PADDLE_CACHE = os.environ.get("PADDLE_CACHE_DIR", os.path.expanduser("~/.paddlex"))
+os.makedirs(_PADDLE_CACHE, exist_ok=True)
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"   # 跳过联网检查，直接用本地模型
+
+_paddle_init_failed = False
+
+if "paddle" in _OCR_ENGINE_ORDER:
+    try:
+        from paddleocr import PaddleOCR   # 只检测能否 import
+        HAS_PADDLE = True
+        print("✅ PaddleOCR 已导入（将在子进程里运行，首次使用时下载模型）")
+    except Exception:
+        HAS_PADDLE = False
+else:
     HAS_PADDLE = False
 
 # ── Tesseract ────────────────────────────────────────────────
 HAS_TESSERACT = False
 _TESS_LANG = "eng"
 
-try:
-    import pytesseract
-    from PIL import Image, ImageFilter, ImageEnhance
-    _available_langs = pytesseract.get_languages(config="")
-    HAS_TESSERACT = True
-    _found = [l for l in ["chi_sim", "chi_tra", "eng"] if l in _available_langs]
-    _TESS_LANG = "+".join(_found) if _found else "eng"
-    print(f"✅ Tesseract 可用，语言: {_TESS_LANG}")
-except Exception as _e:
-    pass
+if "tesseract" in _OCR_ENGINE_ORDER:
+    try:
+        import pytesseract
+        from PIL import Image, ImageFilter, ImageEnhance
+        _available_langs = pytesseract.get_languages(config="")
+        HAS_TESSERACT = True
+        _found = [l for l in ["chi_sim", "chi_tra", "eng"] if l in _available_langs]
+        _TESS_LANG = "+".join(_found) if _found else "eng"
+    except Exception:
+        pass
 
 try:
     from PIL import Image, ImageFilter, ImageEnhance
@@ -76,20 +127,38 @@ try:
 except ImportError:
     HAS_PIL = False
 
+# ── 打印当前 OCR 引擎状态 ─────────────────────────────────────
+def _ocr_status_line() -> str:
+    available = []
+    for eng in _OCR_ENGINE_ORDER:
+        if eng == "llm"       and HAS_LLM_VISION: available.append(f"LLM({_VISION_MODEL})")
+        if eng == "paddle"    and HAS_PADDLE:      available.append("PaddleOCR")
+        if eng == "tesseract" and HAS_TESSERACT:   available.append(f"Tesseract({_TESS_LANG})")
+    if available:
+        return "✅ OCR 引擎（按优先级）: " + " → ".join(available)
+    return "⚠️  无可用 OCR 引擎"
+
+print(_ocr_status_line())
+
+
 
 # ── 自定义异常 ───────────────────────────────────────────────
 
 class OCRUnavailableError(RuntimeError):
-    """OCR 引擎未安装时抛出，携带安装指引"""
+    """无任何可用 OCR 引擎时抛出，携带安装指引"""
     INSTALL_GUIDE = (
         "未检测到可用的 OCR 引擎，无法识别图片文字。\n"
-        "请安装以下任意一个 OCR 引擎后重启服务：\n\n"
-        "  方案 A — PaddleOCR（推荐，中文识别率高）：\n"
+        "请选择以下任意一个方案后重启服务：\n\n"
+        "  方案 A — LLM Vision（推荐，已有 qwen3.5:9b 无需额外安装）：\n"
+        "    确保 Ollama 已启动，且已拉取模型：\n"
+        "    ollama serve\n"
+        "    ollama pull qwen3.5:9b\n\n"
+        "  方案 B — PaddleOCR（纯本地，中文识别率高）：\n"
         "    pip install paddlepaddle paddleocr\n\n"
-        "  方案 B — Tesseract（轻量）：\n"
+        "  方案 C — Tesseract（轻量）：\n"
         "    # Ubuntu/Debian\n"
         "    sudo apt-get install tesseract-ocr tesseract-ocr-chi-sim\n"
-        "    pip install pytesseract\n\n"
+        "    pip install pytesseract\n"
         "    # macOS\n"
         "    brew install tesseract tesseract-lang\n"
         "    pip install pytesseract"
@@ -144,8 +213,14 @@ def file_sha256(path: str) -> str:
 
 
 def clean_text(text: str) -> str:
-    """去除中文字符间多余空格，规范化换行"""
+    """通用文本清洗：去除中文字符间多余空格，规范化换行"""
     text = re.sub(r'([\u4e00-\u9fff])\s+([\u4e00-\u9fff])', r'\1\2', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def clean_text_table(text: str) -> str:
+    """表格文本清洗：只规范化换行，保留列间空格"""
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -169,6 +244,47 @@ def detect_heading_level(text: str, style_name: str = "") -> int:
     if re.match(r'^\d+\.\d+\s', text):                             return 2
     if re.match(r'^\d+[\.、]\s', text):                            return 2
     return 0
+
+
+def _is_table_text(text: str) -> bool:
+    """判断 OCR 文本是否为表格：超过一半的行含有数字或分隔符"""
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) < 3:
+        return False
+    table_lines = sum(
+        1 for l in lines
+        if re.search(r'\d', l) and (len(l.split()) > 2 or ',' in l or '.' in l)
+    )
+    return table_lines / len(lines) > 0.4
+
+
+def chunk_ocr_table(text: str, fname: str, file_path: str,
+                    fhash: str, window: int = 4, step: int = 2) -> list[str]:
+    """
+    图片表格专用切块：滑动窗口，每块都带表头行。
+    window: 每块包含的数据行数
+    step:   窗口滑动步长
+    """
+    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return []
+
+    # 前两行通常是标题+表头，固定保留
+    header_lines = lines[:2]
+    data_lines   = lines[2:]
+
+    if len(data_lines) <= window:
+        return [text]   # 行数少，整体一块
+
+    header = "\n".join(header_lines)
+    chunks = []
+    i = 0
+    while i < len(data_lines):
+        block = data_lines[i : i + window]
+        chunks.append(header + "\n" + "\n".join(block))
+        i += step
+
+    return chunks
 
 
 def smart_chunk_text(text: str, max_size: int = 800, overlap: int = 100) -> list[str]:
@@ -205,10 +321,10 @@ def _heading_path(stack: list) -> str:
     return " > ".join(t for _, t in stack)
 
 
-# ── OCR ──────────────────────────────────────────────────────
+# ── OCR 底层实现 ──────────────────────────────────────────────
 
 def _preprocess_image(img):
-    """图像预处理：灰度→放大→锐化→增强对比度→二值化"""
+    """传统 OCR 图像预处理：灰度→放大→锐化→增强对比度→二值化"""
     if not HAS_PIL:
         return img
     img = img.convert("L")
@@ -222,48 +338,182 @@ def _preprocess_image(img):
     return img
 
 
-def _ocr_with_paddle(img_path: str) -> str:
-    global _paddle_instance
-    if _paddle_instance is None:
-        _paddle_instance = PaddleOCR(use_angle_cls=True, lang="ch")
-    try:
-        result = _paddle_instance.ocr(img_path, angle_classification=True)
-    except TypeError:
-        result = _paddle_instance.ocr(img_path)
-    lines = []
-    if result:
-        for line in result:
-            if line:
-                for item in line:
-                    if item and len(item) >= 2:
-                        lines.append(item[1][0])
-    return "\n".join(lines)
+_paddle_init_failed = False   # 初始化失败后永久跳过，不重试
 
 
-def _ocr_image_obj(img) -> str:
-    img = _preprocess_image(img)
-    if HAS_PADDLE:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            img.convert("RGB").save(f.name)
-            tmp = f.name
+# ── Paddle OCR（直接调用，模型已本地缓存）───────────────────
+_paddle_instance = None
+_paddle_init_failed = False
+
+
+def _paddle_result_to_text(results) -> str:
+    """
+    把新版 OCRResult 转成有结构的文本。
+    利用 rec_boxes 的 Y 坐标把文字分组为行，再按 X 排序还原列顺序。
+    """
+    for res in results:
         try:
-            return _ocr_with_paddle(tmp)
-        finally:
+            data = res.json.get("res", {})
+            texts = data.get("rec_texts", [])
+            boxes = data.get("rec_boxes", [])   # [x1,y1,x2,y2]
+            if not texts:
+                continue
+
+            if not boxes or len(boxes) != len(texts):
+                return "\n".join(t for t in texts if t.strip())
+
+            # 按 Y 中心分组（同一行的 Y 中心差距 < 15px）
+            items = sorted(zip(boxes, texts), key=lambda x: (x[0][1] + x[0][3]) / 2)
+            rows = []
+            current_row = [items[0]]
+            current_y = (items[0][0][1] + items[0][0][3]) / 2
+
+            for box, text in items[1:]:
+                y_center = (box[1] + box[3]) / 2
+                if abs(y_center - current_y) < 15:
+                    current_row.append((box, text))
+                else:
+                    rows.append(current_row)
+                    current_row = [(box, text)]
+                    current_y = y_center
+            rows.append(current_row)
+
+            # 每行内按 X 排序
+            lines = []
+            for row in rows:
+                row.sort(key=lambda x: x[0][0])
+                lines.append("  ".join(t for _, t in row if t.strip()))
+
+            return "\n".join(l for l in lines if l.strip())
+        except Exception:
+            # 降级：直接拼接
+            try:
+                texts = res.json.get("res", {}).get("rec_texts", [])
+                return "\n".join(t for t in texts if t.strip())
+            except Exception:
+                pass
+    return ""
+
+
+def _run_paddle(img_bytes: bytes) -> str:
+    global _paddle_instance, _paddle_init_failed, HAS_PADDLE
+
+    if _paddle_init_failed:
+        raise RuntimeError("PaddleOCR 之前已失败，已禁用")
+
+    if _paddle_instance is None:
+        try:
+            try:
+                _paddle_instance = PaddleOCR(use_textline_orientation=True, lang="ch")
+            except TypeError:
+                _paddle_instance = PaddleOCR(use_angle_cls=True, lang="ch")
+        except BaseException as e:
+            _paddle_init_failed = True
+            HAS_PADDLE = False
+            raise RuntimeError(f"PaddleOCR 初始化失败: {e}") from e
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+        f.write(img_bytes)
+        tmp = f.name
+    try:
+        results = list(_paddle_instance.predict(tmp))
+        return _paddle_result_to_text(results)
+    except BaseException as e:
+        _paddle_init_failed = True
+        HAS_PADDLE = False
+        raise RuntimeError(f"PaddleOCR 执行失败: {e}") from e
+    finally:
+        try:
             os.unlink(tmp)
-    elif HAS_TESSERACT:
-        return pytesseract.image_to_string(img, lang=_TESS_LANG, config="--psm 6")
+        except Exception:
+            pass
+
+
+
+def _run_tesseract(img_bytes: bytes) -> str:
+    img = Image.open(io.BytesIO(img_bytes))
+    img = _preprocess_image(img)
+    return pytesseract.image_to_string(img, lang=_TESS_LANG, config="--psm 6")
+
+
+def _compress_for_llm(img_bytes: bytes) -> bytes:
+    """压缩图片再发给 LLM：长边限 _LLM_OCR_MAX_PX，转 JPEG quality=85"""
+    if not HAS_PIL:
+        return img_bytes
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h = img.size
+        if max(w, h) > _LLM_OCR_MAX_PX:
+            scale = _LLM_OCR_MAX_PX / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+        compressed = buf.getvalue()
+        print(f"    🖼  压缩: {len(img_bytes)//1024}KB → {len(compressed)//1024}KB ({img.size[0]}x{img.size[1]})")
+        return compressed
+    except Exception as e:
+        print(f"    ⚠️  压缩失败，使用原图: {e}")
+        return img_bytes
+
+
+def _run_llm(img_bytes: bytes) -> str:
+    img_bytes = _compress_for_llm(img_bytes)
+    b64 = _base64.b64encode(img_bytes).decode()
+    payload = _json.dumps({
+        "model":  _VISION_MODEL,
+        "prompt": (
+            "请提取并输出这张图片中的所有文字内容，保持原有段落和换行结构。"
+            "只输出文字内容本身，不要添加任何解释、标签或前缀。"
+            "如果图片中没有文字，输出空字符串。"
+        ),
+        "images": [b64],
+        "stream": False,
+        "options": {"temperature": 0, "num_predict": 2048},
+    }).encode()
+    req = _urllib_req.Request(
+        f"{_OLLAMA_URL}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with _urllib_req.urlopen(req, timeout=_LLM_OCR_TIMEOUT) as r:
+        return _json.loads(r.read()).get("response", "").strip()
+
+
+# 引擎名 → (可用标志, 执行函数)
+_ENGINE_MAP = {
+    "paddle":    (lambda: HAS_PADDLE,     _run_paddle),
+    "tesseract": (lambda: HAS_TESSERACT,  _run_tesseract),
+    "llm":       (lambda: HAS_LLM_VISION, _run_llm),
+}
+
+
+def _do_ocr(img_bytes: bytes) -> str:
+    """
+    按 OCR_ENGINES 顺序依次尝试，第一个返回非空结果即采用。
+    全部失败返回空字符串。
+    """
+    for eng in _OCR_ENGINE_ORDER:
+        avail_fn, run_fn = _ENGINE_MAP.get(eng, (lambda: False, None))
+        if not avail_fn() or run_fn is None:
+            continue
+        try:
+            text = run_fn(img_bytes)
+            if text.strip():
+                return text.strip()
+        except BaseException as e:
+            print(f"    ⚠️  {eng} OCR 失败: {e}，尝试下一个引擎")
     return ""
 
 
 def _ocr_bytes(img_bytes: bytes, ext: str = ".png") -> str:
-    if not HAS_PIL:
-        return ""
-    try:
-        img = Image.open(io.BytesIO(img_bytes))
-        return _ocr_image_obj(img)
-    except Exception as e:
-        print(f"    ⚠️  图片 OCR 失败: {e}")
-        return ""
+    return _do_ocr(img_bytes)
+
+
+def _ocr_image_obj(img) -> str:
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return _do_ocr(buf.getvalue())
 
 
 def _ocr_page(page) -> str:
@@ -271,19 +521,28 @@ def _ocr_page(page) -> str:
     try:
         mat = fitz.Matrix(2, 2)
         pix = page.get_pixmap(matrix=mat)
-        return _ocr_bytes(pix.tobytes("png"), ".png")
+        return _do_ocr(pix.tobytes("png"))
     except Exception as e:
         print(f"  OCR 失败: {e}")
     return ""
 
 
+
+
 # ── PDF 解析 ──────────────────────────────────────────────────
+
+def _has_any_ocr() -> bool:
+    """是否有任何可用 OCR 引擎"""
+    return (HAS_PADDLE and "paddle" in _OCR_ENGINE_ORDER) or \
+           (HAS_TESSERACT and "tesseract" in _OCR_ENGINE_ORDER) or \
+           (HAS_LLM_VISION and "llm" in _OCR_ENGINE_ORDER)
+
 
 def _extract_pdf_page_images(page, fname, file_path, fhash,
                               page_num, heading_path, start_idx) -> list[Chunk]:
     """提取 PDF 页面内嵌图片并 OCR"""
     chunks = []
-    if not HAS_PYMUPDF or (not HAS_PADDLE and not HAS_TESSERACT):
+    if not HAS_PYMUPDF or not _has_any_ocr():
         return chunks
     try:
         seen_xref = set()
@@ -578,14 +837,11 @@ def parse_excel(file_path: str) -> list[Chunk]:
 # ── 独立图片 OCR ──────────────────────────────────────────────
 
 def parse_image(file_path: str) -> list[Chunk]:
-    """独立图片文件 OCR。无 OCR 引擎时抛出 OCRUnavailableError。"""
+    """独立图片文件 OCR。按 OCR_ENGINES 顺序尝试可用引擎。"""
     fhash = file_sha256(file_path)
     fname = os.path.basename(file_path)
 
-    if not HAS_PIL:
-        raise OCRUnavailableError(fname)  # Pillow 也算无引擎
-
-    if not HAS_PADDLE and not HAS_TESSERACT:
+    if not HAS_PIL or not _has_any_ocr():
         raise OCRUnavailableError(fname)
 
     try:
@@ -593,7 +849,7 @@ def parse_image(file_path: str) -> list[Chunk]:
         text = _ocr_image_obj(img)
     except OCRUnavailableError:
         raise
-    except Exception as e:
+    except BaseException as e:
         print(f"    ❌ 图片处理失败 {fname}: {e}")
         return []
 
@@ -601,12 +857,30 @@ def parse_image(file_path: str) -> list[Chunk]:
         print(f"    ⚠️  OCR 未识别到文字: {fname}")
         return []
 
+    cleaned = clean_text_table(text) if _is_table_text(text) else clean_text(text)
+
+    if _is_table_text(text):
+        # 表格图片：整体作为一块，保留完整行列结构，确保所有关键词都在同一向量里
+        print(f"    📊 检测到表格图片，整体入库（不切片）")
+        print(f"    📝 识别内容预览（前500字）:\n{cleaned[:500]}")
+        texts = [cleaned]
+    else:
+        texts = smart_chunk_text(cleaned)
+
     return [
         Chunk(
             text=t, file_name=fname, file_path=file_path,
             file_hash=fhash, page=1, block_type="image", chunk_index=i
         )
-        for i, t in enumerate(smart_chunk_text(clean_text(text))) if t.strip()
+        for i, t in enumerate(texts) if t.strip()
+    ]
+
+    return [
+        Chunk(
+            text=t, file_name=fname, file_path=file_path,
+            file_hash=fhash, page=1, block_type="image", chunk_index=i
+        )
+        for i, t in enumerate(texts) if t.strip()
     ]
 
 

@@ -1,0 +1,9 @@
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "sk-kimi-vhx58DVCffzCbgIsoVNch66SXDwjgfQUjSGtA5khpB8fbTcpicD1p1oPQIIf0m8n",
+    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+    "API_TIMEOUT_MS": 600000,
+    "ANTHROPIC_SMALL_FAST_MODEL": "kimi-for-coding",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}
