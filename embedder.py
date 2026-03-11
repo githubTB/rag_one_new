@@ -8,7 +8,7 @@ embedder.py — 单例 Embedding 模型
 
 from sentence_transformers import SentenceTransformer
 
-MODEL_NAME = "BAAI/bge-base-zh-v1.5"
+MODEL_NAME = "BAAI/bge-m3"
 
 _embedder = None
 

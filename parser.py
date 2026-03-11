@@ -255,6 +255,27 @@ def detect_heading_level(text: str, style_name: str = "") -> int:
     return 0
 
 
+def _print_chunks(chunks: list, source: str = "") -> None:
+    """统一调试打印：把所有 chunk 内容输出到控制台"""
+    if not chunks:
+        return
+    prefix = f"[{source}] " if source else ""
+    sep = "─" * 60
+    print(f"\n{sep}")
+    print(f"  {prefix}共 {len(chunks)} 个 chunk")
+    print(sep)
+    for c in chunks:
+        tag = {"text": "📝", "heading": "🏷 ", "table": "📊", "image": "🖼 "}.get(c.block_type, "  ")
+        loc = f"第{c.page}页"
+        if c.heading_path:
+            loc += f" / {c.heading_path}"
+        print(f"\n  {tag} chunk#{c.chunk_index}  [{c.block_type}]  {loc}")
+        print(f"  {'·' * 40}")
+        for line in c.text.splitlines():
+            print(f"  {line}")
+    print(f"\n{sep}\n")
+
+
 def _is_table_text(text: str) -> bool:
     """判断 OCR 文本是否为表格：超过一半的行含有数字或分隔符"""
     lines = [l for l in text.splitlines() if l.strip()]
@@ -538,25 +559,26 @@ def _run_llm(img_bytes: bytes) -> str:
     payload = _json.dumps({
         "model":  _VISION_MODEL,
         "prompt": (
-            "请提取并输出这张图片中的所有文字内容，保持原有段落和换行结构。"
-            "只输出文字内容本身，不要添加任何解释、标签或前缀。"
+            "请完整提取并输出这张图片中的【全部】文字内容，不得遗漏任何行或列。"
+            "保持原有段落和换行结构，表格每行单独一行，列之间用两个空格分隔。"
+            "只输出文字内容本身，不要添加任何解释、标签、省略号或'等'字样。"
+            "必须输出到最后一行，中途不得停止。"
             "如果图片中没有文字，输出空字符串。"
         ),
         "images": [b64],
         "stream": False,
-        "options": {"temperature": 0, "num_predict": 2048},
+        "options": {"temperature": 0, "num_predict": -1, "num_ctx": 8192},
     }).encode()
     req = _urllib_req.Request(
-        f"{_OLLAMA_URL}/api/generate",
+        f"{_OLLAMA_URL}/api/chat",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     with _urllib_req.urlopen(req, timeout=_LLM_OCR_TIMEOUT) as r:
-        text = _json.loads(r.read()).get("response", "").strip()
+        text = _json.loads(r.read())["choices"][0]["message"]["content"].strip()
     if text:
-        preview = text[:200] + ("..." if len(text) > 200 else "")
-        print(f"    📝 LLM OCR 识别结果（{len(text)}字）:\n{preview}")
+        print(f"    📝 LLM OCR 识别结果（{len(text)}字）:\n{text}")
     else:
         print(f"    ⚠️  LLM OCR 未识别到文字")
     return text
@@ -678,13 +700,20 @@ def parse_pdf(file_path: str) -> list[Chunk]:
         if len(text_raw.strip()) < 50:
             ocr_text = _ocr_page(page)
             if ocr_text:
+                page_chunks = []
                 for t in smart_chunk_text(clean_text(ocr_text)):
                     chunks.append(Chunk(
                         text=t, file_name=fname, file_path=file_path,
                         file_hash=fhash, page=page_display, block_type="image",
                         chunk_index=idx, heading_path=_heading_path(heading_stack)
                     ))
+                    page_chunks.append(chunks[-1])
                     idx += 1
+                print(f"  🖼  PDF 第{page_display}页（扫描页 OCR）→ {len(page_chunks)} chunk")
+                for c in page_chunks:
+                    print(f"    chunk#{c.chunk_index}: {c.text}")
+            else:
+                print(f"  ⚠️  PDF 第{page_display}页扫描页 OCR 无结果")
             continue
 
         # 表格（pdfplumber）
@@ -759,6 +788,7 @@ def parse_pdf(file_path: str) -> list[Chunk]:
     doc.close()
     if plumber_doc:
         plumber_doc.close()
+    _print_chunks(chunks, f"PDF · {fname}")
     return chunks
 
 
@@ -792,8 +822,45 @@ def _extract_docx_paragraph_images(element, word_doc) -> list[tuple[bytes, str]]
     return results
 
 
+def _docx_table_to_text(table) -> tuple[list[str], str]:
+    """
+    Word 表格 → (headers, table_text)
+    处理合并单元格：同一个 tc（表格单元格）对象只取一次，避免内容重复。
+    """
+    from docx.table import Table
+    seen_tc = set()
+    grid: list[list[str]] = []
+
+    for row in table.rows:
+        row_cells: list[str] = []
+        for cell in row.cells:
+            tc_id = id(cell._tc)
+            if tc_id in seen_tc:
+                row_cells.append("")          # 合并格占位，保持列数一致
+            else:
+                seen_tc.add(tc_id)
+                row_cells.append(cell.text.strip())
+        # 跳过全空行
+        if any(row_cells):
+            grid.append(row_cells)
+
+    if not grid:
+        return [], ""
+
+    headers = grid[0]
+    lines = [" | ".join(c for c in r) for r in grid]
+    return headers, "\n".join(lines)
+
+
 def parse_docx(file_path: str) -> list[Chunk]:
-    """python-docx 按 body 顺序解析，保留标题层级和表格"""
+    """
+    python-docx 按 body 顺序解析：
+    - 标题层级识别（style + 正则双保险）
+    - 列表段落识别（List Paragraph style → 前缀 • 合并入上下文）
+    - 表格合并单元格去重
+    - 嵌入图片 OCR
+    - page 用段落计数器近似模拟（每 40 段为一"页"）
+    """
     chunks = []
     fhash = file_sha256(file_path)
     fname = os.path.basename(file_path)
@@ -803,7 +870,29 @@ def parse_docx(file_path: str) -> list[Chunk]:
         return chunks
 
     word = DocxDocument(file_path)
-    heading_stack = []
+    heading_stack: list = []
+    para_counter = 0           # 段落计数，用于近似页码
+    PAGE_SIZE = 40             # 每 PAGE_SIZE 段算一页
+
+    # 列表缓冲：连续列表项先收集，一起作为一个 text chunk
+    list_buf: list[str] = []
+    list_heading_path: str = ""
+
+    def _flush_list():
+        nonlocal idx
+        if not list_buf:
+            return
+        merged = "\n".join(f"• {l}" for l in list_buf)
+        page_n = max(1, para_counter // PAGE_SIZE)
+        for t in smart_chunk_text(merged):
+            if t.strip():
+                chunks.append(Chunk(
+                    text=t, file_name=fname, file_path=file_path,
+                    file_hash=fhash, page=page_n, block_type="text",
+                    heading_path=list_heading_path, chunk_index=idx
+                ))
+                idx += 1
+        list_buf.clear()
 
     for element in word.element.body:
         tag = element.tag.split("}")[-1]
@@ -811,16 +900,19 @@ def parse_docx(file_path: str) -> list[Chunk]:
         if tag == "p":
             from docx.text.paragraph import Paragraph
             para = Paragraph(element, word)
+            para_counter += 1
+            page_n = max(1, para_counter // PAGE_SIZE)
 
             # 嵌入图片 OCR
             for img_bytes, img_ext in _extract_docx_paragraph_images(element, word):
                 img_text = _ocr_bytes(img_bytes, img_ext)
                 if img_text.strip():
+                    _flush_list()
                     for t in smart_chunk_text(clean_text(img_text)):
                         if t.strip():
                             chunks.append(Chunk(
                                 text=t, file_name=fname, file_path=file_path,
-                                file_hash=fhash, page=1, block_type="image",
+                                file_hash=fhash, page=page_n, block_type="image",
                                 heading_path=_heading_path(heading_stack), chunk_index=idx
                             ))
                             idx += 1
@@ -832,52 +924,68 @@ def parse_docx(file_path: str) -> list[Chunk]:
             style = para.style.name if para.style else ""
             level = detect_heading_level(text, style)
 
+            # ── 标题 ──
             if level > 0:
+                _flush_list()
                 _update_heading_stack(heading_stack, level, text)
                 chunks.append(Chunk(
                     text=text, file_name=fname, file_path=file_path,
-                    file_hash=fhash, page=1, block_type="heading",
+                    file_hash=fhash, page=page_n, block_type="heading",
                     heading_level=level, heading_path=_heading_path(heading_stack),
                     chunk_index=idx
                 ))
                 idx += 1
+
+            # ── 列表段落：缓冲合并 ──
+            elif "list" in style.lower():
+                if not list_buf:
+                    list_heading_path = _heading_path(heading_stack)
+                list_buf.append(text)
+
+            # ── 普通段落 ──
             else:
+                _flush_list()
                 for t in smart_chunk_text(text):
                     if t.strip():
                         chunks.append(Chunk(
                             text=t, file_name=fname, file_path=file_path,
-                            file_hash=fhash, page=1, block_type="text",
+                            file_hash=fhash, page=page_n, block_type="text",
                             heading_path=_heading_path(heading_stack), chunk_index=idx
                         ))
                         idx += 1
 
         elif tag == "tbl":
             from docx.table import Table
+            _flush_list()
             table = Table(element, word)
             if not table.rows:
                 continue
-            headers = [c.text.strip() for c in table.rows[0].cells]
-            data_rows = [
-                " | ".join(c.text.strip() for c in row.cells)
-                for row in table.rows[1:] if any(c.text.strip() for c in row.cells)
-            ]
-            table_text = " | ".join(headers) + "\n" + "\n".join(data_rows)
+            headers, table_text = _docx_table_to_text(table)
+            if not table_text.strip():
+                continue
+            page_n = max(1, para_counter // PAGE_SIZE)
             chunks.append(Chunk(
                 text=table_text, file_name=fname, file_path=file_path,
-                file_hash=fhash, page=1, block_type="table",
+                file_hash=fhash, page=page_n, block_type="table",
                 table_headers=headers, heading_path=_heading_path(heading_stack),
                 chunk_index=idx
             ))
             idx += 1
 
+    _flush_list()  # 文档末尾可能还有未刷出的列表
+    _print_chunks(chunks, f"Word · {fname}")
     return chunks
 
 
 # ── Excel 解析 ────────────────────────────────────────────────
 
 def _fmt_cell(val) -> str:
+    """单元格值格式化，处理 None / float / datetime / date"""
     if val is None:
         return ""
+    import datetime
+    if isinstance(val, (datetime.datetime, datetime.date)):
+        return val.strftime("%Y-%m-%d")
     if isinstance(val, float):
         if val == int(val):
             return str(int(val))
@@ -886,33 +994,104 @@ def _fmt_cell(val) -> str:
     return str(val).strip()
 
 
+def _expand_merged_cells(ws) -> list[list[str]]:
+    """
+    展开合并单元格：把每个合并区域的左上角值填充到区域内所有格，
+    避免合并格在 iter_rows 中出现 None。
+    返回二维列表 grid[row][col]（0-based）。
+    """
+    # 先把合并区域的值记录下来
+    merge_values: dict[tuple, str] = {}
+    for merged_range in ws.merged_cells.ranges:
+        top_left = ws.cell(merged_range.min_row, merged_range.min_col)
+        val = _fmt_cell(top_left.value)
+        for row in range(merged_range.min_row, merged_range.max_row + 1):
+            for col in range(merged_range.min_col, merged_range.max_col + 1):
+                merge_values[(row, col)] = val
+
+    grid = []
+    for row_idx, row in enumerate(ws.iter_rows(), start=1):
+        cells = []
+        for col_idx, cell in enumerate(row, start=1):
+            if (row_idx, col_idx) in merge_values:
+                cells.append(merge_values[(row_idx, col_idx)])
+            else:
+                cells.append(_fmt_cell(cell.value))
+        grid.append(cells)
+    return grid
+
+
+# Excel 每个 chunk 最多包含的数据行数（表头行不计入）
+_EXCEL_CHUNK_ROWS = int(os.environ.get("EXCEL_CHUNK_ROWS", "50"))
+
+
 def parse_excel(file_path: str) -> list[Chunk]:
-    """每个 Sheet 作为一个 table chunk"""
+    """
+    每个 Sheet 按滑动窗口切块，每块带表头行。
+    处理合并单元格、日期格式化、空行过滤。
+    chunk_index 全局递增，heading_path 含 Sheet 名 + 块编号。
+    """
     chunks = []
     fhash = file_sha256(file_path)
     fname = os.path.basename(file_path)
+    global_idx = 0
 
     if not HAS_OPENPYXL:
         return chunks
 
     wb = openpyxl.load_workbook(file_path, data_only=True)
-    for idx, sheet_name in enumerate(wb.sheetnames):
+
+    for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
+        grid = _expand_merged_cells(ws)
+
+        # 过滤全空行
+        grid = [r for r in grid if any(c for c in r)]
+        if not grid:
             continue
-        headers = [str(c or "").strip() for c in rows[0]]
+
+        headers = grid[0]
+        header_line = " | ".join(headers)
         data_rows = [
-            " | ".join(_fmt_cell(c) for c in row)
-            for row in rows[1:] if any(c is not None for c in row)
+            " | ".join(r)
+            for r in grid[1:]
+            if any(c for c in r)
         ]
-        table_text = f"[Sheet: {sheet_name}]\n" + " | ".join(headers) + "\n" + "\n".join(data_rows)
-        chunks.append(Chunk(
-            text=table_text, file_name=fname, file_path=file_path,
-            file_hash=fhash, page=idx + 1, block_type="table",
-            table_headers=headers, heading_path=f"Sheet: {sheet_name}",
-            chunk_index=idx
-        ))
+
+        if not data_rows:
+            # 只有表头，整体入库
+            text = f"[Sheet: {sheet_name}]\n{header_line}"
+            chunks.append(Chunk(
+                text=text, file_name=fname, file_path=file_path,
+                file_hash=fhash, page=1, block_type="table",
+                table_headers=headers,
+                heading_path=f"Sheet: {sheet_name}",
+                chunk_index=global_idx
+            ))
+            global_idx += 1
+            continue
+
+        # 按 _EXCEL_CHUNK_ROWS 切块，每块保留表头
+        total_rows = len(data_rows)
+        chunk_num = 0
+        for start in range(0, total_rows, _EXCEL_CHUNK_ROWS):
+            batch = data_rows[start: start + _EXCEL_CHUNK_ROWS]
+            end = min(start + _EXCEL_CHUNK_ROWS, total_rows)
+            row_range = f"行{start + 2}~{end + 1}"   # +1 因为表头占第1行，+2 因为1-based
+            heading = f"Sheet: {sheet_name} / {row_range}"
+
+            text = f"[Sheet: {sheet_name}]（{row_range}）\n{header_line}\n" + "\n".join(batch)
+            chunks.append(Chunk(
+                text=text, file_name=fname, file_path=file_path,
+                file_hash=fhash, page=chunk_num + 1, block_type="table",
+                table_headers=headers,
+                heading_path=heading,
+                chunk_index=global_idx
+            ))
+            global_idx += 1
+            chunk_num += 1
+
+    _print_chunks(chunks, f"Excel · {fname}")
     return chunks
 
 
@@ -950,13 +1129,15 @@ def parse_image(file_path: str) -> list[Chunk]:
     else:
         texts = smart_chunk_text(cleaned)
 
-    return [
+    result_chunks = [
         Chunk(
             text=t, file_name=fname, file_path=file_path,
             file_hash=fhash, page=1, block_type="image", chunk_index=i
         )
         for i, t in enumerate(texts) if t.strip()
     ]
+    _print_chunks(result_chunks, f"图片 · {fname}")
+    return result_chunks
 
 
 # ── 统一入口 ──────────────────────────────────────────────────

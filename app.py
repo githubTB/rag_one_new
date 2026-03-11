@@ -1,9 +1,9 @@
 """
-app.py — RAG 知识库 API（基于 LLM）
+app.py — RAG 知识库 API（基于 qwen3.5:9b）
 
 接口：
   POST /api/ingest          上传文件 → 解析 → 向量化 → 入库（自动去重）
-  GET  /api/query           向量检索 + LLM 生成带来源标注的答案
+  GET  /api/query           向量检索 + qwen3.5:9b 生成带来源标注的答案
   GET  /api/search          纯向量检索（不走 LLM）
   GET  /api/files           已入库文件列表
   DELETE /api/files/{name}  删除文件
@@ -55,10 +55,20 @@ UPLOAD_DIR  = os.getenv("UPLOAD_DIR",  "uploaded_files")
 DB_PATH     = os.getenv("DB_PATH",     "rag_meta.db")
 MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
-OLLAMA_URL  = os.getenv("OLLAMA_URL",  "http://localhost:11434")
-LLM_MODEL   = os.getenv("LLM_MODEL",   "qwen3.5:2b")   # 问答模型
-LLM_OCR_MODEL = os.getenv("LLM_OCR_MODEL", "minicpm-v")  # OCR 专用 vision 模型
 COLLECTION  = os.getenv("COLLECTION",  "rag_docs")
+
+# ── LLM 提供商配置 ────────────────────────────────────────────
+# LLM_PROVIDER:
+#   ollama — 本地 Ollama，走 /api/generate
+#   api    — 任意 OpenAI 兼容接口（DeepSeek / 千问 / Moonshot / 本地 vLLM 等）
+LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "ollama")       # ollama | api
+OLLAMA_URL      = os.getenv("OLLAMA_URL",   "http://localhost:11434")
+
+# api 模式专用（LLM_PROVIDER=api 时生效）
+LLM_API_BASE    = os.getenv("LLM_API_BASE", "").rstrip("/")   # 必填：API base URL，末尾不加斜杠
+LLM_API_KEY     = os.getenv("LLM_API_KEY",  "")             # 必填：API Key
+LLM_MODEL       = os.getenv("LLM_MODEL",    "qwen3.5:2b")   # 模型名，ollama/api 各自填对应值
+LLM_OCR_MODEL   = os.getenv("LLM_OCR_MODEL","minicpm-v")    # OCR vision 模型（仅 Ollama 模式）
 
 # LLM 生成参数
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
@@ -79,8 +89,8 @@ embedder   = None
 @app.on_event("startup")
 async def startup():
     global db_conn, milvus_col, embedder
-    logger.info("🚀 启动 RAG 服务...")
-    logger.info(f"📝 问答模型: {LLM_MODEL}  |  🖼  OCR 模型: {LLM_OCR_MODEL}")
+    logger.info(f"🚀 启动 RAG 服务...")
+    logger.info(f"🤖 LLM 提供商: {LLM_PROVIDER.upper()}  |  📝 问答模型: {LLM_MODEL}  |  🖼  OCR 模型: {LLM_OCR_MODEL}")
 
     db_conn  = init_db(DB_PATH)
     logger.info("✅ SQLite 元数据库已初始化")
@@ -153,7 +163,7 @@ def _hits_to_citations(hits: list[dict]) -> list[Citation]:
 
 
 def _build_prompt(query: str, hits: list[dict]) -> str:
-    """构建带来源标注的 RAG Prompt，专门针对 LLM 系列模型优化"""
+    """构建带来源标注的 RAG Prompt，专门针对 qwen 系列模型优化"""
     context_parts = []
     for i, h in enumerate(hits):
         loc = f"文件：{h['file_name']} 第{h['page']}页"
@@ -187,22 +197,63 @@ def _build_prompt(query: str, hits: list[dict]) -> str:
 回答："""
 
 
-async def _call_ollama(prompt: str) -> str:
-    """调用 Ollama LLM 生成答案"""
+async def _call_llm(prompt: str) -> str:
+    """
+    统一 LLM 调用入口，根据 LLM_PROVIDER 路由：
+      ollama — 本地 Ollama /api/generate
+      api    — 任意 OpenAI 兼容接口 /chat/completions
+               （DeepSeek / 千问 / Moonshot / vLLM 等）
+    """
     import httpx
-    payload = {
-        "model":  LLM_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
+
+    if LLM_PROVIDER == "api":
+        if not LLM_API_KEY:
+            raise RuntimeError("LLM_PROVIDER=api 时必须设置 LLM_API_KEY")
+        if not LLM_API_BASE:
+            raise RuntimeError("LLM_PROVIDER=api 时必须设置 LLM_API_BASE")
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": LLM_TEMPERATURE,
-            "num_predict": LLM_MAX_TOKENS,
+            "max_tokens": LLM_MAX_TOKENS,
+            "stream": False,
         }
-    }
-    async with httpx.AsyncClient(timeout=180) as client:
-        resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-        resp.raise_for_status()
-        return resp.json().get("response", "").strip()
+        headers = {
+            "Authorization": f"Bearer {LLM_API_KEY}",
+            "Content-Type":  "application/json",
+        }
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{LLM_API_BASE}/chat/completions",
+                json=payload, headers=headers
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+
+    else:
+        # ── Ollama（本地/局域网）────────────────────────────────
+        payload = {
+            "model":    LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream":   False,
+            "think":    False,   # 关闭思考模式，避免 content 为空
+            "options": {
+                "temperature": LLM_TEMPERATURE,
+                "num_predict": LLM_MAX_TOKENS,
+            }
+        }
+        async with httpx.AsyncClient(timeout=180) as client:
+            url = f"{OLLAMA_URL}/api/chat"
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            msg = resp.json().get("message", {})
+            content = msg.get("content", "").strip()
+            if not content:
+                # qwen3.5 等思考模型可能把结果放在 thinking 字段
+                content = msg.get("thinking", "").strip()
+            logger.info(f"🤖 content({len(msg.get('content',''))}字) thinking({len(msg.get('thinking',''))}字)")
+            logger.info(f"🤖 实际内容前300字:\n{content[:300]}")
+            return content
 
 
 # ── API 路由 ──────────────────────────────────────────────────
@@ -319,16 +370,37 @@ async def _detect_category(q: str, categories: list[str]) -> Optional[str]:
         f"如果无法判断或问题跨多个分类，输出「全部」。"
     )
     try:
-        payload = {
-            "model": LLM_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0, "num_predict": 32},
-        }
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-            r.raise_for_status()
-            result = r.json().get("response", "").strip().strip('"').strip()
+        if LLM_PROVIDER == "api":
+            if not LLM_API_KEY or not LLM_API_BASE:
+                return None
+            payload = {
+                "model": LLM_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+                "max_tokens": 32,
+                "stream": False,
+            }
+            headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(f"{LLM_API_BASE}/chat/completions", json=payload, headers=headers)
+                r.raise_for_status()
+                result = r.json()["choices"][0]["message"]["content"].strip().strip('"').strip()
+        else:
+            payload = {
+                "model":    LLM_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream":   False,
+                "think":    False,
+                "options":  {"temperature": 0, "num_predict": 32},
+            }
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+                r.raise_for_status()
+                msg = r.json().get("message", {})
+                content = msg.get("content", "").strip()
+                if not content:
+                    content = msg.get("thinking", "").strip()
+                result = content.strip('"').strip()
         if result in categories:
             logger.info(f"🗂  自动路由到分类: {result}")
             return result
@@ -374,12 +446,12 @@ async def query(
             citations=[], llm_available=False
         )
 
-    # 调用 LLM
+    # 调用 qwen3.5:9b
     llm_ok = False
     answer = ""
     try:
         prompt = _build_prompt(q, hits)
-        answer = await _call_ollama(prompt)
+        answer = await _call_llm(prompt)
         llm_ok = True
         logger.info(f"LLM 回答生成成功，长度 {len(answer)} 字符")
     except Exception as e:
@@ -473,9 +545,13 @@ async def health():
     llm_reachable = False
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{OLLAMA_URL}/api/tags")
-            llm_reachable = r.status_code == 200
+        if LLM_PROVIDER == "api":
+            # api 模式：只验证配置是否填写，不发网络请求（避免每次轮询消耗 API 配额）
+            llm_reachable = bool(LLM_API_KEY and LLM_API_BASE)
+        else:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"{OLLAMA_URL}/api/tags")
+                llm_reachable = r.status_code == 200
     except Exception:
         pass
 
@@ -484,7 +560,8 @@ async def health():
         "milvus":        milvus_ok,
         "embedder":      embedder is not None,
         "embed_model":   EMBED_MODEL_NAME,
-        "llm_url":       OLLAMA_URL,
+        "llm_provider":  LLM_PROVIDER,
+        "llm_url":       LLM_API_BASE if LLM_PROVIDER == "api" else OLLAMA_URL,
         "llm_ocr_model": LLM_OCR_MODEL,
         "llm_model":     LLM_MODEL,
         "llm_reachable": llm_reachable,

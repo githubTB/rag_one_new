@@ -686,15 +686,22 @@ async function fetchHealth() {
 
 function showHealth() {
   const d = healthData;
+  const isApi = (d.llm_provider || 'ollama') === 'api';
+  const providerLabel = isApi
+    ? '<span style="background:#fff0e6;color:#b45309;padding:1px 7px;border-radius:4px;font-size:0.75rem;">线上 API</span>'
+    : '<span style="background:#e6f0ff;color:#1e40af;padding:1px 7px;border-radius:4px;font-size:0.75rem;">Ollama 本地</span>';
+  const urlLabel  = isApi ? 'API 地址' : 'Ollama 地址';
+  const connLabel = isApi ? 'API 连通'  : 'Ollama 连通';
   const rows = [
-    ['状态',         d.status === 'ok' ? '<span class="ok">正常</span>' : '<span class="fail">部分不可用</span>'],
-    ['Milvus',       d.milvus      ? '<span class="ok">✓ 已连接</span>' : '<span class="fail">✗ 未连接</span>'],
-    ['Ollama 地址',  d.llm_url     || '-'],
-    ['Ollama 连通',  d.llm_reachable ? '<span class="ok">✓ 可用</span>' : '<span class="fail">✗ 不可用</span>'],
+    ['状态',       d.status === 'ok' ? '<span class="ok">正常</span>' : '<span class="fail">部分不可用</span>'],
+    ['Milvus',     d.milvus      ? '<span class="ok">✓ 已连接</span>' : '<span class="fail">✗ 未连接</span>'],
+    ['LLM 提供商', providerLabel],
+    [urlLabel,     d.llm_url     || '-'],
+    [connLabel,    d.llm_reachable ? '<span class="ok">✓ 可用</span>' : '<span class="fail">✗ 不可用</span>'],
     ['─────────', '─────────────────'],
-    ['向量化模型',   d.embed_model  || '-'],
-    ['OCR 模型',     d.llm_ocr_model || '-'],
-    ['对话模型',     d.llm_model    || '-'],
+    ['向量化模型', d.embed_model   || '-'],
+    ['OCR 模型',   d.llm_ocr_model || '-'],
+    ['对话模型',   d.llm_model     || '-'],
   ];
   document.getElementById('health-details').innerHTML =
     rows.map(([k, v]) => k.startsWith('─')
