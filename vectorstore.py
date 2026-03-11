@@ -223,9 +223,31 @@ def _keyword_search(col, query: str, top_k: int = 20,
     关键词兜底检索：把 query 拆成词，用 Milvus expr like 匹配 text 字段。
     用于捕捉向量检索遗漏的精确词（人名、编号、专业术语等）。
     """
-    stop = {"的", "了", "是", "在", "和", "与", "或", "有", "这", "那", "中", "为", "对"}
+    stop = {"的", "了", "是", "在", "和", "与", "或", "有", "这", "那", "中", "为", "对",
+            "所有", "全部", "哪些", "什么", "请问", "告诉我", "查询", "列出", "列举"}
+    # 先按标点切词
     tokens = re.split(r'[\s，。！？；、,\.!?;]+', query.strip())
     keywords = [t for t in tokens if len(t) >= 2 and t not in stop]
+
+    # 对较长 token（>=4字）额外产生 2-4 字 n-gram 子串
+    # 解决"所有法人代表"→无法匹配"法人代表"的问题
+    extra = []
+    for tok in list(keywords):
+        if len(tok) >= 4:
+            for n in (4, 3, 2):
+                for i in range(len(tok) - n + 1):
+                    sub = tok[i:i+n]
+                    if sub not in stop and sub not in keywords and sub not in extra:
+                        extra.append(sub)
+    # 去重，按长度降序，最多5个
+    seen: set = set()
+    dedup = []
+    for k in sorted(keywords + extra, key=len, reverse=True):
+        if k not in seen:
+            seen.add(k)
+            dedup.append(k)
+    keywords = dedup[:5]
+
     if not keywords:
         return []
 

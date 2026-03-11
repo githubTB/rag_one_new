@@ -1079,14 +1079,42 @@ def parse_pdf(file_path: str) -> list[Chunk]:
             is_bold  = sum(bolds) / len(bolds) > 0.5 if bolds else False
             page_text_blocks.append((block_text, avg_size, is_bold))
 
+        # 正文 block 聚合：短块先缓冲，超过阈值或遇到标题时才刷出
+        # 避免"法人代表：凌昌利"这类单行 block 单独成 chunk 导致语义极弱
+        pending_text_parts: list[str] = []
+        pending_heading_path: str = _heading_path(heading_stack)
+        MERGE_THRESHOLD = 400  # 累积超过此长度才刷出
+
+        def _flush_pending():
+            nonlocal idx
+            if not pending_text_parts:
+                return
+            merged = "\n".join(pending_text_parts)
+            for t in smart_chunk_text(merged):
+                if t.strip():
+                    chunks.append(Chunk(
+                        text=t, file_name=fname, file_path=file_path,
+                        file_hash=fhash, page=page_display, block_type="text",
+                        heading_path=pending_heading_path, chunk_index=idx
+                    ))
+                    idx += 1
+            pending_text_parts.clear()
+
         for block_text, avg_size, is_bold in page_text_blocks:
             # 判断是否为标题
             level = 0
             if avg_size >= 16 or (avg_size >= 13 and is_bold and len(block_text) < 80):
                 level = 1 if avg_size >= 18 else (2 if avg_size >= 15 else 3)
                 level = detect_heading_level(block_text) or level
+            # detect_heading_level 也单独检测（不依赖字号）
+            if level == 0:
+                level = detect_heading_level(block_text)
+
             if level > 0:
+                # 遇到标题前先刷出待合并正文
+                _flush_pending()
                 _update_heading_stack(heading_stack, level, block_text)
+                pending_heading_path = _heading_path(heading_stack)
                 chunks.append(Chunk(
                     text=block_text, file_name=fname, file_path=file_path,
                     file_hash=fhash, page=page_display, block_type="heading",
@@ -1095,15 +1123,15 @@ def parse_pdf(file_path: str) -> list[Chunk]:
                 ))
                 idx += 1
             else:
-                # 正文：带上当前标题路径，保证语义完整
-                for t in smart_chunk_text(block_text):
-                    if t.strip():
-                        chunks.append(Chunk(
-                            text=t, file_name=fname, file_path=file_path,
-                            file_hash=fhash, page=page_display, block_type="text",
-                            heading_path=_heading_path(heading_stack), chunk_index=idx
-                        ))
-                        idx += 1
+                # 正文：累积合并
+                pending_text_parts.append(block_text)
+                pending_heading_path = _heading_path(heading_stack)
+                # 超过阈值才刷出，保证 chunk 有足够语义密度
+                if sum(len(p) for p in pending_text_parts) >= MERGE_THRESHOLD:
+                    _flush_pending()
+
+        # 页末刷出剩余正文
+        _flush_pending()
 
     doc.close()
     if plumber_doc:
@@ -1145,62 +1173,31 @@ def _extract_docx_paragraph_images(element, word_doc) -> list[tuple[bytes, str]]
 def _docx_table_to_text(table) -> tuple[list[str], str]:
     """
     Word 表格 → (headers, table_text)
-    处理合并单元格：同一行内同一个 tc（表格单元格）对象只取一次，避免水平合并单元格内容重复。
-    注意：seen_tc 只在一行内有效，跨行不复用（python-docx 会复用 cell 对象）。
+    处理合并单元格：同一个 tc（表格单元格）对象只取一次，避免内容重复。
     """
     from docx.table import Table
-    from docx.oxml.ns import qn
-
+    seen_tc = set()
     grid: list[list[str]] = []
 
     for row in table.rows:
-        seen_tc: set[int] = set()  # 每行独立，修复跨行 cell 对象复用问题
         row_cells: list[str] = []
         for cell in row.cells:
             tc_id = id(cell._tc)
             if tc_id in seen_tc:
-                row_cells.append("")          # 水平合并格占位
+                row_cells.append("")          # 合并格占位，保持列数一致
             else:
                 seen_tc.add(tc_id)
-                # 优先用 cell.text，但如果为空尝试直接读 XML
-                text = cell.text.strip()
-                if not text:
-                    texts = [t.text for t in cell._tc.iter(qn('w:t')) if t.text]
-                    text = "".join(texts).strip()
-                row_cells.append(text)
+                row_cells.append(cell.text.strip())
+        # 跳过全空行
         if any(row_cells):
             grid.append(row_cells)
 
     if not grid:
         return [], ""
 
-    headers = grid[0] if grid else []
+    headers = grid[0]
     lines = [" | ".join(c for c in r) for r in grid]
     return headers, "\n".join(lines)
-
-
-def _docx_table_from_xml(table) -> list[list[str]]:
-    """
-    备用方案：直接从 XML 解析表格，绕过 python-docx 的 row/cell 抽象。
-    解决某些 Word 表格 row.cells 返回不完整的问题。
-    """
-    from docx.oxml.ns import qn
-    tbl = table._tbl
-    grid: list[list[str]] = []
-
-    # 获取所有行 <w:tr>
-    for tr in tbl.iter(qn('w:tr')):
-        row_cells: list[str] = []
-        # 获取行内所有单元格 <w:tc>
-        for tc in tr.iter(qn('w:tc')):
-            # 提取单元格内所有 <w:t> 文本
-            texts = [t.text for t in tc.iter(qn('w:t')) if t.text]
-            cell_text = "".join(texts).strip()
-            row_cells.append(cell_text)
-        if any(row_cells):
-            grid.append(row_cells)
-
-    return grid
 
 
 def parse_docx(file_path: str) -> list[Chunk]:
@@ -1327,38 +1324,15 @@ def parse_docx(file_path: str) -> list[Chunk]:
                     re.search(r'表\s*[一二三四五六七八九十百]', prev_para_text)
                 )
             )
-            # 大表格使用滑动窗口切片，每块保留表头
-            header_line = " | ".join(headers) if headers else ""
-            data_rows = table_text.split("\n")[1:] if "\n" in table_text else []  # 去掉表头行
+            table_chunk_text = f"[{prev_para_text}]\n{table_text}" if _is_table_caption else table_text
 
-            # 如果表格很大（超过 20 行），或者总长度超过 3000，启用滑动窗口
-            if len(data_rows) > 20 or len(table_text) > 3000:
-                window_size = 15  # 每块最多 15 行数据
-                step = 10         # 滑动步长
-                for i in range(0, len(data_rows), step):
-                    batch = data_rows[i:i + window_size]
-                    if not batch:
-                        continue
-                    chunk_text = f"[{prev_para_text}]\n" if _is_table_caption else ""
-                    if header_line:
-                        chunk_text += header_line + "\n"
-                    chunk_text += "\n".join(batch)
-                    chunks.append(Chunk(
-                        text=chunk_text, file_name=fname, file_path=file_path,
-                        file_hash=fhash, page=page_n, block_type="table",
-                        table_headers=headers, heading_path=_heading_path(heading_stack),
-                        chunk_index=idx
-                    ))
-                    idx += 1
-            else:
-                table_chunk_text = f"[{prev_para_text}]\n{table_text}" if _is_table_caption else table_text
-                chunks.append(Chunk(
-                    text=table_chunk_text, file_name=fname, file_path=file_path,
-                    file_hash=fhash, page=page_n, block_type="table",
-                    table_headers=headers, heading_path=_heading_path(heading_stack),
-                    chunk_index=idx
-                ))
-                idx += 1
+            chunks.append(Chunk(
+                text=table_chunk_text, file_name=fname, file_path=file_path,
+                file_hash=fhash, page=page_n, block_type="table",
+                table_headers=headers, heading_path=_heading_path(heading_stack),
+                chunk_index=idx
+            ))
+            idx += 1
             prev_para_text = ""  # 标题已消费，清空
 
     _flush_list()  # 文档末尾可能还有未刷出的列表
