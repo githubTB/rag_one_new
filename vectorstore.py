@@ -5,6 +5,7 @@ vectorstore.py — Milvus 向量库 + SQLite 文件元数据管理
           heading_path、heading_level、table_headers、chunk_index、text、category
 """
 
+import re
 import sqlite3
 from typing import Optional
 
@@ -215,15 +216,98 @@ def delete_by_file_hash(col, file_hash: str):
     print(f"✅ 已从 Milvus 删除: {file_hash[:8]}...")
 
 
+def _keyword_search(col, query: str, top_k: int = 20,
+                    file_filter: Optional[str] = None,
+                    category_filter: Optional[str] = None) -> list[dict]:
+    """
+    关键词兜底检索：把 query 拆成词，用 Milvus expr like 匹配 text 字段。
+    用于捕捉向量检索遗漏的精确词（人名、编号、专业术语等）。
+    """
+    stop = {"的", "了", "是", "在", "和", "与", "或", "有", "这", "那", "中", "为", "对"}
+    tokens = re.split(r'[\s，。！？；、,\.!?;]+', query.strip())
+    keywords = [t for t in tokens if len(t) >= 2 and t not in stop]
+    if not keywords:
+        return []
+
+    exprs = []
+    if file_filter:
+        exprs.append(f'file_name == "{file_filter}"')
+    if category_filter:
+        exprs.append(f'category == "{category_filter}"')
+    # text 非空保护（避免 None 导致 BM25 报错）
+    exprs.append('text != ""')
+    # 每个关键词 OR 匹配
+    kw_expr = " or ".join(f'text like "%{kw}%"' for kw in keywords[:5])
+    exprs.append(f"({kw_expr})")
+    expr = " and ".join(exprs)
+
+    try:
+        results = col.query(
+            expr=expr,
+            output_fields=["file_name", "file_hash", "category", "page", "block_type",
+                           "heading_path", "table_headers", "chunk_index", "text"],
+            limit=top_k
+        )
+        hits = []
+        for e in results:
+            text = e.get("text") or ""
+            if len(text.strip()) < 10:  # 过滤垃圾短 chunk
+                continue
+            hit_count = sum(1 for kw in keywords if kw in text)
+            hits.append({
+                "text":          text,
+                "score":         0.0,
+                "kw_score":      hit_count / len(keywords),
+                "file_name":     e.get("file_name", ""),
+                "file_hash":     e.get("file_hash", ""),
+                "category":      e.get("category", ""),
+                "page":          e.get("page", 1),
+                "block_type":    e.get("block_type", "text"),
+                "heading_path":  e.get("heading_path", ""),
+                "table_headers": e.get("table_headers", ""),
+                "chunk_index":   e.get("chunk_index", 0),
+            })
+        return hits
+    except Exception as e:
+        print(f"⚠️  关键词检索失败: {e}")
+        return []
+
+
 def multi_stage_search(col, query: str, query_embedding: list[float],
                        top_k: int = 5, file_filter: Optional[str] = None,
                        category_filter: Optional[str] = None) -> list[dict]:
-    """向量粗排 → Reranker 精排（可选）"""
-    candidates = vector_search(col, query_embedding, top_k=top_k * 4,
-                               file_filter=file_filter, category_filter=category_filter)
+    """向量检索 + 关键词兜底 → 融合去重 → Reranker 精排（可选）"""
+    MIN_TEXT_LEN = 10  # 过滤太短的垃圾 chunk
+
+    # 1. 向量检索（多取几个用于候选，最终截断到 top_k）
+    vec_hits = vector_search(col, query_embedding, top_k=top_k * 4,
+                             file_filter=file_filter, category_filter=category_filter)
+    for h in vec_hits:
+        h.setdefault("kw_score", 0.0)
+
+    # 2. 关键词兜底
+    kw_hits = _keyword_search(col, query, top_k=top_k * 2,
+                              file_filter=file_filter, category_filter=category_filter)
+
+    # 3. 融合去重（以 file_name+chunk_index 为唯一键）
+    seen: dict[str, dict] = {}
+    for h in vec_hits:
+        if len((h.get("text") or "").strip()) < MIN_TEXT_LEN:
+            continue
+        key = f"{h['file_name']}#{h['chunk_index']}"
+        seen[key] = h
+    for h in kw_hits:
+        key = f"{h['file_name']}#{h['chunk_index']}"
+        if key not in seen:
+            seen[key] = h
+        else:
+            seen[key]["kw_score"] = max(seen[key].get("kw_score", 0), h["kw_score"])
+
+    candidates = list(seen.values())
     if not candidates:
         return []
 
+    # 4. Reranker 精排 或 融合分排序
     reranker = get_reranker()
     if reranker:
         try:
@@ -233,9 +317,11 @@ def multi_stage_search(col, query: str, query_embedding: list[float],
                 c["rerank_score"] = float(scores[i])
             candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
         except Exception as e:
-            print(f"⚠️  Reranker 精排失败，降级用向量分数: {e}")
-            candidates.sort(key=lambda x: x["score"], reverse=True)
+            print(f"⚠️  Reranker 精排失败，降级融合分: {e}")
+            candidates.sort(key=lambda x: x["score"] * 0.7 + x.get("kw_score", 0) * 0.3, reverse=True)
     else:
-        candidates.sort(key=lambda x: x["score"], reverse=True)
+        # 向量分 0.7 + 关键词分 0.3 融合
+        candidates.sort(key=lambda x: x["score"] * 0.7 + x.get("kw_score", 0) * 0.3, reverse=True)
 
+    # 严格按 top_k 截断
     return candidates[:top_k]

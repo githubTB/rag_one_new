@@ -47,7 +47,7 @@ from parser import parse_file, file_sha256, Chunk, HAS_PADDLE, HAS_TESSERACT, OC
 from vectorstore import (
     init_db, is_file_indexed, register_file, list_indexed_files,
     list_categories, delete_file_from_index, connect_milvus, get_or_create_collection,
-    insert_chunks, multi_stage_search, delete_by_file_hash
+    insert_chunks, smart_search, delete_by_file_hash
 )
 
 # ── 配置（全部可用环境变量覆盖）─────────────────────────────
@@ -162,8 +162,41 @@ def _hits_to_citations(hits: list[dict]) -> list[Citation]:
     ]
 
 
+def _detect_query_type(query: str) -> str:
+    """检测查询类型"""
+    query_lower = query.lower()
+    
+    # 列表类查询
+    if any(keyword in query_lower for keyword in ["所有", "全部", "清单", "列表", "汇总", "统计", "有哪些", "all", "list", "complete"]):
+        return "list"
+    
+    # 定义类查询
+    elif any(keyword in query_lower for keyword in ["什么是", "定义", "概念", "含义", "意思"]):
+        return "definition"
+    
+    # 比较类查询
+    elif any(keyword in query_lower for keyword in ["比较", "对比", "区别", "不同", "优势", "劣势"]):
+        return "comparison"
+    
+    # 因果类查询
+    elif any(keyword in query_lower for keyword in ["为什么", "原因", "因为", "所以", "导致", "影响"]):
+        return "cause_effect"
+    
+    # 方法类查询
+    elif any(keyword in query_lower for keyword in ["如何", "怎么", "方法", "步骤", "教程", "指南"]):
+        return "method"
+    
+    # 其他查询
+    else:
+        return "general"
+
+
 def _build_prompt(query: str, hits: list[dict]) -> str:
     """构建带来源标注的 RAG Prompt，专门针对 qwen 系列模型优化"""
+    # 检测查询类型
+    query_type = _detect_query_type(query)
+    
+    # 构建上下文
     context_parts = []
     for i, h in enumerate(hits):
         loc = f"文件：{h['file_name']} 第{h['page']}页"
@@ -171,7 +204,14 @@ def _build_prompt(query: str, hits: list[dict]) -> str:
             loc = f"分类：{h['category']} / {loc}"
         if h["heading_path"]:
             loc += f" / {h['heading_path']}"
-        context_parts.append(f"[来源{i + 1}] {loc}\n{h['text']}")
+        # 突出显示关键词
+        text = h['text']
+        # 提取查询中的关键词
+        query_keywords = [kw for kw in query.split() if len(kw) > 1]
+        for kw in query_keywords:
+            if kw in text:
+                text = text.replace(kw, f"**{kw}**")
+        context_parts.append(f"[来源{i + 1}] {loc}\n{text}")
 
     context = "\n\n---\n\n".join(context_parts)
 
@@ -181,20 +221,36 @@ def _build_prompt(query: str, hits: list[dict]) -> str:
     if categories:
         category_hint = f"\n注意：以下参考资料来自【{'、'.join(categories)}】分类，回答时请结合分类背景作答，不要混淆不同分类的内容。\n"
 
+    # 根据查询类型定制提示词
+    query_type_hint = ""
+    if query_type == "list":
+        query_type_hint = "\n**列表类查询**：请将找到的所有相关信息都列出来，确保完整性，不要遗漏任何信息。\n"
+    elif query_type == "definition":
+        query_type_hint = "\n**定义类查询**：请提供清晰、准确的定义，并结合参考资料中的内容进行解释。\n"
+    elif query_type == "comparison":
+        query_type_hint = "\n**比较类查询**：请对相关内容进行详细比较，分析其异同点。\n"
+    elif query_type == "cause_effect":
+        query_type_hint = "\n**因果类查询**：请分析原因和结果，提供逻辑清晰的解释。\n"
+    elif query_type == "method":
+        query_type_hint = "\n**方法类查询**：请提供详细的步骤和操作指南。\n"
+
     return f"""你是一个专业的知识库问答助手。请严格基于以下参考资料回答用户问题。
 {category_hint}
+{query_type_hint}
 要求：
-1. 每引用某条来源的内容时，在句末用 [来源N] 标注（N 为来源编号）
-2. 若参考资料中没有相关信息，明确回答"参考资料中未找到相关信息"，不要编造
-3. 回答要简洁、准确、有条理
-4. 若有多个来源支持同一观点，可同时标注多个来源，如 [来源1][来源2]
+1. **前面的来源更可靠**：来源按相关度排序，[来源1]、[来源2]...越靠前越重要，优先采纳前面来源的信息
+2. **精准引用**：每引用某条来源的内容时，在句末用 [来源N] 标注（N 为来源编号）
+3. **信息完整性**：若参考资料中没有相关信息，明确回答"参考资料中未找到相关信息"，不要编造
+4. **回答质量**：回答要简洁、准确、有条理，使用专业术语
+5. **多来源验证**：若有多个来源支持同一观点，可同时标注多个来源，如 [来源1][来源2]
+6. **格式规范**：对于列表、步骤等内容，使用适当的格式（如数字编号、 bullet points）
 
-参考资料：
+参考资料（按相关度从高到低排序）：
 {context}
 
 用户问题：{query}
 
-回答："""
+请基于上述资料作答，优先相信排在前面的来源："""
 
 
 async def _call_llm(prompt: str) -> str:
@@ -248,11 +304,11 @@ async def _call_llm(prompt: str) -> str:
             resp.raise_for_status()
             msg = resp.json().get("message", {})
             content = msg.get("content", "").strip()
-            if not content:
-                # qwen3.5 等思考模型可能把结果放在 thinking 字段
-                content = msg.get("thinking", "").strip()
-            logger.info(f"🤖 content({len(msg.get('content',''))}字) thinking({len(msg.get('thinking',''))}字)")
-            logger.info(f"🤖 实际内容前300字:\n{content[:300]}")
+            thinking = msg.get("thinking", "").strip()
+            logger.info(f"🤖 content({len(content)}字) thinking({len(thinking)}字)")
+            if not content and thinking:
+                logger.info("🤖 content 为空，使用完整 thinking 内容")
+                content = thinking
             return content
 
 
@@ -432,19 +488,31 @@ async def query(
         all_cats = list_categories(db_conn)
         resolved_category = await _detect_category(q, all_cats)
 
-    hits = multi_stage_search(milvus_col, q, q_emb, top_k=top_k,
-                              file_filter=file_name, category_filter=resolved_category)
+    hits, search_mode = smart_search(milvus_col, q, q_emb, top_k=top_k,
+                                      file_filter=file_name, category_filter=resolved_category)
+    logger.info(f"🔍 检索模式: {search_mode} | 命中 {len(hits)} 条")
 
     # 如果限定分类后没结果，降级到全库检索
     if not hits and resolved_category:
         logger.info(f"分类 '{resolved_category}' 无结果，降级全库检索")
-        hits = multi_stage_search(milvus_col, q, q_emb, top_k=top_k, file_filter=file_name)
+        hits, search_mode = smart_search(milvus_col, q, q_emb, top_k=top_k, file_filter=file_name)
+        logger.info(f"🔍 降级检索模式: {search_mode} | 命中 {len(hits)} 条")
 
     if not hits:
         return QueryResponse(
             query=q, answer="知识库中未找到相关内容。",
             citations=[], llm_available=False
         )
+
+    # 打印送入 LLM 的 top-k chunks（列表类查询结果多，只显示摘要）
+    display_limit = 10 if search_mode == "full_text" else len(hits)
+    logger.info(f"📋 送入 LLM 的 {len(hits)} chunks（查询: {q[:50]}...）")
+    for i, h in enumerate(hits[:display_limit]):
+        logger.info(f"  ── chunk[{i+1}] {h['file_name']} 第{h['page']}页 [{h['block_type']}] score={h.get('score', 0):.4f}")
+        text_preview = h['text'][:200].replace(chr(10), ' ')
+        logger.info(f"    {text_preview}...")
+    if len(hits) > display_limit:
+        logger.info(f"  ... 还有 {len(hits) - display_limit} 条结果未显示")
 
     # 调用 qwen3.5:9b
     llm_ok = False
@@ -479,8 +547,9 @@ async def search(
     """纯向量检索（不走 LLM），返回带溯源信息的结果"""
     _ensure_milvus()
     q_emb = embedder.encode(q, normalize_embeddings=True).tolist()
-    hits = multi_stage_search(milvus_col, q, q_emb, top_k=top_k,
-                              file_filter=file_name, category_filter=category)
+    hits, search_mode = smart_search(milvus_col, q, q_emb, top_k=top_k,
+                                      file_filter=file_name, category_filter=category)
+    logger.info(f"🔍 检索模式: {search_mode} | 命中 {len(hits)} 条")
     return SearchResponse(query=q, results=_hits_to_citations(hits))
 
 

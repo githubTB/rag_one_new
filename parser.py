@@ -317,26 +317,55 @@ def chunk_ocr_table(text: str, fname: str, file_path: str,
     return chunks
 
 
-def smart_chunk_text(text: str, max_size: int = 800, overlap: int = 100) -> list[str]:
-    """按段落语义边界切块，避免字符数硬切"""
+def smart_chunk_text(text: str, max_size: int = 1200, overlap: int = 150) -> list[str]:
+    """
+    按语义边界切块：
+    - 优先按双换行（段落）分割
+    - 段落内超长再按句子分割（。！？；）
+    - 相邻块间保留 overlap 字符上下文，避免语义截断
+    - 单个段落超过 max_size 才强制切，不会把短段落切碎
+    """
     if len(text) <= max_size:
         return [text]
 
+    # 先按段落分
     paragraphs = [p.strip() for p in re.split(r'\n\n+', text) if p.strip()]
-    chunks, current, current_len = [], [], 0
 
+    # 段落内超长的再按句子切
+    sentences = []
     for para in paragraphs:
-        if current_len + len(para) > max_size and current:
+        if len(para) <= max_size:
+            sentences.append(para)
+        else:
+            # 按中文句末标点切句
+            parts = re.split(r'(?<=[。！？；\n])', para)
+            buf, buf_len = [], 0
+            for part in parts:
+                if buf_len + len(part) > max_size and buf:
+                    sentences.append("".join(buf))
+                    # overlap：保留最后一句
+                    buf = buf[-1:] if buf else []
+                    buf_len = len(buf[0]) if buf else 0
+                buf.append(part)
+                buf_len += len(part)
+            if buf:
+                sentences.append("".join(buf))
+
+    # 把句子组合成 chunk，相邻 chunk 共享 overlap
+    chunks, current, current_len = [], [], 0
+    for sent in sentences:
+        if current_len + len(sent) > max_size and current:
             chunks.append("\n\n".join(current))
+            # 保留最后一个段落作为 overlap
             current = current[-1:]
             current_len = len(current[0]) if current else 0
-        current.append(para)
-        current_len += len(para)
+        current.append(sent)
+        current_len += len(sent)
 
     if current:
         chunks.append("\n\n".join(current))
 
-    return chunks
+    return [c for c in chunks if c.strip()]
 
 
 # ── 标题栈管理 ────────────────────────────────────────────────
@@ -459,11 +488,208 @@ def _paddle_result_to_text(results) -> str:
     return ""
 
 
-def _run_paddle(img_bytes: bytes) -> str:
+def _rebuild_table_from_boxes(results) -> str:
+    """
+    用 OCR box 坐标重建表格结构，补全空单元格。
+    兼容 PaddleOCR 3.x（dt_polys + rec_texts）和旧版（rec_boxes）
+    """
+    all_items = []  # [(x1,y1,x2,y2, text), ...]
+    for res in results:
+        try:
+            data = res.json.get("res", {})
+            texts = data.get("rec_texts", [])
+
+            # 3.x 用 dt_polys（多边形顶点列表），旧版用 rec_boxes（[x1,y1,x2,y2]）
+            polys = data.get("dt_polys", [])
+            boxes = data.get("rec_boxes", [])
+
+            if not texts:
+                continue
+
+            if polys and len(polys) == len(texts):
+                # dt_polys: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] 取外接矩形
+                for poly, text in zip(polys, texts):
+                    if not text.strip():
+                        continue
+                    xs = [p[0] for p in poly]
+                    ys = [p[1] for p in poly]
+                    all_items.append((min(xs), min(ys), max(xs), max(ys), text.strip()))
+            elif boxes and len(boxes) == len(texts):
+                # 旧版 rec_boxes: [x1,y1,x2,y2]
+                for box, text in zip(boxes, texts):
+                    if text.strip():
+                        all_items.append((box[0], box[1], box[2], box[3], text.strip()))
+            else:
+                # 无坐标信息，直接返回纯文本
+                return "\n".join(t for t in texts if t.strip())
+        except Exception as e:
+            print(f"    ⚠️  box 解析失败: {e}")
+
+    if not all_items:
+        return ""
+
+    # 1. 按 Y 中心分行
+    avg_h = sum(item[3] - item[1] for item in all_items) / len(all_items)
+    tol = max(avg_h * 0.6, 10)
+
+    all_items.sort(key=lambda x: (x[1] + x[3]) / 2)
+    rows: list[list[tuple]] = []
+    current_row = [all_items[0]]
+    current_y = (all_items[0][1] + all_items[0][3]) / 2
+
+    for item in all_items[1:]:
+        y_center = (item[1] + item[3]) / 2
+        if abs(y_center - current_y) <= tol:
+            current_row.append(item)
+        else:
+            rows.append(sorted(current_row, key=lambda x: x[0]))
+            current_row = [item]
+            current_y = y_center
+    rows.append(sorted(current_row, key=lambda x: x[0]))
+
+    if len(rows) < 2:
+        return "\n".join(" ".join(item[4] for item in row) for row in rows)
+
+    # 2. 聚类列中心
+    all_x_centers = sorted((item[0] + item[2]) / 2
+                            for row in rows for item in row)
+    avg_w = sum(item[2] - item[0] for row in rows for item in row) / len(all_items)
+    col_gap = max(avg_w * 1.2, 20)
+
+    col_centers = [all_x_centers[0]]
+    for x in all_x_centers[1:]:
+        if x - col_centers[-1] > col_gap:
+            col_centers.append(x)
+        else:
+            col_centers[-1] = (col_centers[-1] + x) / 2
+
+    n_cols = len(col_centers)
+
+    def assign_col(x_center: float) -> int:
+        return min(range(n_cols), key=lambda i: abs(col_centers[i] - x_center))
+
+    # 3. 每行按列分配，空列填 -
+    lines = []
+    for row in rows:
+        cells = ["-"] * n_cols
+        for item in row:
+            col_idx = assign_col((item[0] + item[2]) / 2)
+            cells[col_idx] = item[4]
+        lines.append("  ".join(cells))
+
+    return "\n".join(lines)
+
+
+def _run_paddle_table(img_bytes: bytes) -> str:
+    """用普通 PaddleOCR + 坐标对齐重建表格，保留空单元格"""
+    global _paddle_instance, _paddle_init_failed, HAS_PADDLE
+
+    if _paddle_init_failed:
+        raise RuntimeError("PaddleOCR 已禁用")
+
+    if _paddle_instance is None:
+        try:
+            try:
+                _paddle_instance = PaddleOCR(
+                    use_textline_orientation=True,
+                    lang="ch",
+                    ocr_version="PP-OCRv4",
+                    cpu_threads=2,
+                    enable_mkldnn=False,
+                )
+            except TypeError:
+                _paddle_instance = PaddleOCR(
+                    use_angle_cls=True,
+                    lang="ch",
+                    ocr_version="PP-OCRv4",
+                    cpu_threads=2,
+                    enable_mkldnn=False,
+                )
+        except BaseException as e:
+            _paddle_init_failed = True
+            HAS_PADDLE = False
+            raise RuntimeError(f"PaddleOCR 初始化失败: {e}") from e
+
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            tmp = f.name
+            try:
+                img = Image.open(io.BytesIO(img_bytes))
+                w, h = img.size
+                max_px = 2000
+                if max(w, h) > max_px:
+                    scale = max_px / max(w, h)
+                    img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                img.save(f.name, format="JPEG", quality=90)
+                img.close()
+            except Exception:
+                f.write(img_bytes)
+        del img_bytes
+
+        results = _paddle_instance.predict(tmp)
+        results_list = list(results)
+        text = _rebuild_table_from_boxes(results_list)
+        del results_list
+
+        if text.strip():
+            print(f"    📊 坐标对齐表格识别成功（{len(text)}字）")
+            return text
+        return ""
+    except Exception as e:
+        print(f"    ⚠️  坐标对齐识别失败: {e}")
+        return ""
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
+def _is_table_image_by_structure(img_bytes: bytes, filename: str = "") -> bool:
+    """
+    判断图片是否为表格：
+    1. 文件名含"表"、"table"、"汇总"、"统计" 等关键词
+    2. 图片宽高比 > 1.2（横向布局，典型表格形态）
+    3. 图片足够大（小图一般不是表格）
+    """
+    # 文件名关键词
+    table_keywords = ["表", "table", "汇总", "统计", "报表", "清单", "明细", "账单", "报告"]
+    fname_lower = filename.lower()
+    if any(kw in fname_lower for kw in table_keywords):
+        print(f"    📊 文件名命中表格关键词: {filename}")
+        return True
+
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        w, h = img.size
+        # 宽高比 > 1.2 且面积足够大
+        if w > h * 1.2 and w * h > 80000:
+            print(f"    📊 宽高比触发表格检测: {w}x{h} ratio={w/h:.2f}")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _run_paddle(img_bytes: bytes, filename: str = "") -> str:
     global _paddle_instance, _paddle_init_failed, HAS_PADDLE
 
     if _paddle_init_failed:
         raise RuntimeError("PaddleOCR 之前已失败，已禁用")
+
+    # 先判断是否为表格图片，是则走 table pipeline（含坐标对齐兜底）
+    is_table = _is_table_image_by_structure(img_bytes, filename=filename)
+    if is_table:
+        print("    📊 检测到表格结构，使用 table pipeline")
+        try:
+            table_text = _run_paddle_table(img_bytes)
+            if table_text.strip():
+                return table_text
+            print("    ⚠️  table pipeline 无结果，降级坐标对齐")
+        except Exception as e:
+            print(f"    ⚠️  table pipeline 异常: {e}，降级坐标对齐")
 
     if _paddle_instance is None:
         try:
@@ -472,9 +698,9 @@ def _run_paddle(img_bytes: bytes) -> str:
                 _paddle_instance = PaddleOCR(
                     use_textline_orientation=True,
                     lang="ch",
-                    ocr_version="PP-OCRv4",   # v4 mobile，比 v5 server 轻量很多
-                    cpu_threads=2,             # 限制 CPU 线程数
-                    enable_mkldnn=False,       # macOS 关闭 MKL-DNN 避免内存泄漏
+                    ocr_version="PP-OCRv4",
+                    cpu_threads=2,
+                    enable_mkldnn=False,
                 )
             except TypeError:
                 _paddle_instance = PaddleOCR(
@@ -510,9 +736,16 @@ def _run_paddle(img_bytes: bytes) -> str:
         # 原始字节用完释放
         del img_bytes
 
-        results = _paddle_instance.predict(tmp)   # 不 list()，保持生成器惰性求值
-        text = _paddle_result_to_text(results)
-        del results
+        results = _paddle_instance.predict(tmp)
+        results_list = list(results)
+        # 表格图片用坐标对齐重建，普通图片用原始文本
+        if is_table:
+            text = _rebuild_table_from_boxes(results_list)
+            if not text.strip():
+                text = _paddle_result_to_text(iter(results_list))
+        else:
+            text = _paddle_result_to_text(iter(results_list))
+        del results_list
         return text
     except BaseException as e:
         _paddle_init_failed = True
@@ -533,20 +766,52 @@ def _run_tesseract(img_bytes: bytes) -> str:
     return pytesseract.image_to_string(img, lang=_TESS_LANG, config="--psm 6")
 
 
+def _enhance_image_for_ocr(img: "Image.Image") -> "Image.Image":
+    """
+    图像增强（送 OCR 前）：
+    - 灰度化 + 对比度拉伸（模拟 CLAHE，去除过曝/偏暗）
+    - 二次锐化（改善模糊/低分辨率图片）
+    - 转回 RGB（LLM Vision 需要彩色）
+    适用：模糊扫描件、低对比度截图、手写+印刷混合件
+    """
+    if not HAS_PIL:
+        return img
+    try:
+        gray = img.convert("L")
+        pixels = sorted(gray.getdata())
+        n = len(pixels)
+        lo = pixels[max(0, int(n * 0.05))]
+        hi = pixels[min(n - 1, int(n * 0.95))]
+        if hi > lo + 20:
+            gray = gray.point(lambda p: max(0, min(255, int((p - lo) * 255 / (hi - lo)))))
+        gray = gray.filter(ImageFilter.SHARPEN)
+        gray = gray.filter(ImageFilter.SHARPEN)
+        return gray.convert("RGB")
+    except Exception as e:
+        print(f"    ⚠️  图像增强失败，使用原图: {e}")
+        return img
+
+
 def _compress_for_llm(img_bytes: bytes) -> bytes:
-    """压缩图片再发给 LLM：长边限 _LLM_OCR_MAX_PX，转 JPEG quality=85"""
+    """图像增强 + 压缩再发给 LLM：长边限 _LLM_OCR_MAX_PX，转 JPEG quality=88"""
     if not HAS_PIL:
         return img_bytes
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img = _enhance_image_for_ocr(img)
         w, h = img.size
+        # 短边太小时先放大，提升识别率
+        if min(w, h) < 600:
+            scale = 600 / min(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            w, h = img.size
         if max(w, h) > _LLM_OCR_MAX_PX:
             scale = _LLM_OCR_MAX_PX / max(w, h)
             img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85, optimize=True)
+        img.save(buf, format="JPEG", quality=88, optimize=True)
         compressed = buf.getvalue()
-        print(f"    🖼  压缩: {len(img_bytes)//1024}KB → {len(compressed)//1024}KB ({img.size[0]}x{img.size[1]})")
+        print(f"    🖼  增强+压缩: {len(img_bytes)//1024}KB → {len(compressed)//1024}KB ({img.size[0]}x{img.size[1]})")
         return compressed
     except Exception as e:
         print(f"    ⚠️  压缩失败，使用原图: {e}")
@@ -570,13 +835,13 @@ def _run_llm(img_bytes: bytes) -> str:
         "options": {"temperature": 0, "num_predict": -1, "num_ctx": 8192},
     }).encode()
     req = _urllib_req.Request(
-        f"{_OLLAMA_URL}/api/chat",
+        f"{_OLLAMA_URL}/api/generate",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     with _urllib_req.urlopen(req, timeout=_LLM_OCR_TIMEOUT) as r:
-        text = _json.loads(r.read())["choices"][0]["message"]["content"].strip()
+        text = _json.loads(r.read()).get("response", "").strip()
     if text:
         print(f"    📝 LLM OCR 识别结果（{len(text)}字）:\n{text}")
     else:
@@ -592,7 +857,7 @@ _ENGINE_MAP = {
 }
 
 
-def _do_ocr(img_bytes: bytes) -> str:
+def _do_ocr(img_bytes: bytes, filename: str = "") -> str:
     """
     按 OCR_ENGINES 顺序依次尝试，第一个返回非空结果即采用。
     全部失败返回空字符串。
@@ -602,7 +867,10 @@ def _do_ocr(img_bytes: bytes) -> str:
         if not avail_fn() or run_fn is None:
             continue
         try:
-            text = run_fn(img_bytes)
+            if eng == "paddle":
+                text = run_fn(img_bytes, filename)
+            else:
+                text = run_fn(img_bytes)
             if text.strip():
                 return text.strip()
         except BaseException as e:
@@ -610,14 +878,14 @@ def _do_ocr(img_bytes: bytes) -> str:
     return ""
 
 
-def _ocr_bytes(img_bytes: bytes, ext: str = ".png") -> str:
-    return _do_ocr(img_bytes)
+def _ocr_bytes(img_bytes: bytes, ext: str = ".png", filename: str = "") -> str:
+    return _do_ocr(img_bytes, filename=filename)
 
 
-def _ocr_image_obj(img) -> str:
+def _ocr_image_obj(img, filename: str = "") -> str:
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
-    return _do_ocr(buf.getvalue())
+    return _do_ocr(buf.getvalue(), filename=filename)
 
 
 def _ocr_page(page) -> str:
@@ -721,20 +989,58 @@ def parse_pdf(file_path: str) -> list[Chunk]:
         if plumber_doc:
             try:
                 for table in plumber_doc.pages[page_num].extract_tables():
-                    if not table:
+                    if not table or len(table) < 2:
                         continue
-                    headers = [str(c or "").strip() for c in table[0]]
-                    rows = [" | ".join(str(c or "").strip() for c in row)
-                            for row in table[1:] if any(row)]
-                    table_text = " | ".join(headers) + "\n" + "\n".join(rows)
-                    table_texts.add(table_text[:200])
-                    chunks.append(Chunk(
-                        text=table_text, file_name=fname, file_path=file_path,
-                        file_hash=fhash, page=page_display, block_type="table",
-                        table_headers=headers, heading_path=_heading_path(heading_stack),
-                        chunk_index=idx
-                    ))
-                    idx += 1
+                    # 清洗表头：去空、合并多行表头
+                    raw_headers = [str(c or "").strip().replace("\n", " ") for c in table[0]]
+                    headers = [h if h else f"列{i+1}" for i, h in enumerate(raw_headers)]
+                    data_rows = [r for r in table[1:] if any(c and str(c).strip() for c in r)]
+                    if not data_rows:
+                        continue
+
+                    # 结构化：每行 "列名: 值, 列名: 值" 便于语义检索
+                    def fmt_row(row: list, hdrs: list) -> str:
+                        parts = []
+                        for h, c in zip(hdrs, row):
+                            v = str(c or "").strip().replace("\n", " ")
+                            if v:
+                                parts.append(f"{h}: {v}")
+                        return " | ".join(parts)
+
+                    CHUNK_ROWS = 30  # 每块最多30行
+                    header_line = " | ".join(headers)
+                    table_texts.add(header_line[:200])
+
+                    if len(data_rows) <= CHUNK_ROWS:
+                        # 小表整体一块
+                        rows_text = "\n".join(fmt_row(r, headers) for r in data_rows)
+                        table_text = f"[表格] {header_line}\n{rows_text}"
+                        table_texts.add(table_text[:200])
+                        chunks.append(Chunk(
+                            text=table_text, file_name=fname, file_path=file_path,
+                            file_hash=fhash, page=page_display, block_type="table",
+                            table_headers=headers, heading_path=_heading_path(heading_stack),
+                            chunk_index=idx
+                        ))
+                        idx += 1
+                    else:
+                        # 大表滑动窗口切块，每块带表头
+                        step = CHUNK_ROWS // 2
+                        i = 0
+                        while i < len(data_rows):
+                            block_rows = data_rows[i:i + CHUNK_ROWS]
+                            rows_text = "\n".join(fmt_row(r, headers) for r in block_rows)
+                            row_range = f"第{i+1}~{i+len(block_rows)}行"
+                            table_text = f"[表格{row_range}] {header_line}\n{rows_text}"
+                            table_texts.add(table_text[:200])
+                            chunks.append(Chunk(
+                                text=table_text, file_name=fname, file_path=file_path,
+                                file_hash=fhash, page=page_display, block_type="table",
+                                table_headers=headers, heading_path=_heading_path(heading_stack),
+                                chunk_index=idx
+                            ))
+                            idx += 1
+                            i += step
             except Exception as e:
                 print(f"  ⚠️  表格提取失败 page {page_display}: {e}")
 
@@ -746,44 +1052,58 @@ def parse_pdf(file_path: str) -> list[Chunk]:
         chunks.extend(img_chunks)
         idx += len(img_chunks)
 
-        # 文字块（按字体大小识别标题）
+        # 文字块（按 block 聚合，同一 block 内文字合并后再判断标题/正文）
         blocks = page.get_text("dict")["blocks"]
+        page_text_blocks: list[tuple[str, float, bool]] = []  # (text, avg_size, is_heading)
         for block in blocks:
             if block.get("type") != 0:
                 continue
+            block_lines = []
+            sizes, bolds = [], []
             for line in block.get("lines", []):
+                line_text = ""
                 for span in line.get("spans", []):
-                    t = span["text"].strip()
-                    if not t or t in table_texts:
-                        continue
-                    size = span.get("size", 12)
-                    flags = span.get("flags", 0)
-                    is_bold = bool(flags & 2 ** 4)
-                    if size >= 16 or (size >= 13 and is_bold and len(t) < 80):
-                        level = 1 if size >= 18 else (2 if size >= 15 else 3)
-                        level = detect_heading_level(t) or level
-                        _update_heading_stack(heading_stack, level, t)
-                        chunks.append(Chunk(
-                            text=t, file_name=fname, file_path=file_path,
-                            file_hash=fhash, page=page_display, block_type="heading",
-                            heading_level=level, heading_path=_heading_path(heading_stack),
-                            chunk_index=idx
-                        ))
-                        idx += 1
+                    t = span["text"]
+                    if t.strip():
+                        line_text += t
+                        sizes.append(span.get("size", 12))
+                        bolds.append(bool(span.get("flags", 0) & 2 ** 4))
+                if line_text.strip():
+                    block_lines.append(line_text.strip())
+            if not block_lines:
+                continue
+            block_text = "\n".join(block_lines).strip()
+            if not block_text or block_text[:200] in table_texts:
+                continue
+            avg_size = sum(sizes) / len(sizes) if sizes else 12
+            is_bold  = sum(bolds) / len(bolds) > 0.5 if bolds else False
+            page_text_blocks.append((block_text, avg_size, is_bold))
 
-        # 普通文字段落
-        heading_texts = {c.text for c in chunks
-                         if c.page == page_display and c.block_type == "heading"}
-        lines = [l for l in clean_text(text_raw).split("\n")
-                 if l.strip() and l.strip() not in heading_texts]
-        for t in smart_chunk_text("\n".join(lines)):
-            if t.strip():
+        for block_text, avg_size, is_bold in page_text_blocks:
+            # 判断是否为标题
+            level = 0
+            if avg_size >= 16 or (avg_size >= 13 and is_bold and len(block_text) < 80):
+                level = 1 if avg_size >= 18 else (2 if avg_size >= 15 else 3)
+                level = detect_heading_level(block_text) or level
+            if level > 0:
+                _update_heading_stack(heading_stack, level, block_text)
                 chunks.append(Chunk(
-                    text=t, file_name=fname, file_path=file_path,
-                    file_hash=fhash, page=page_display, block_type="text",
-                    heading_path=_heading_path(heading_stack), chunk_index=idx
+                    text=block_text, file_name=fname, file_path=file_path,
+                    file_hash=fhash, page=page_display, block_type="heading",
+                    heading_level=level, heading_path=_heading_path(heading_stack),
+                    chunk_index=idx
                 ))
                 idx += 1
+            else:
+                # 正文：带上当前标题路径，保证语义完整
+                for t in smart_chunk_text(block_text):
+                    if t.strip():
+                        chunks.append(Chunk(
+                            text=t, file_name=fname, file_path=file_path,
+                            file_hash=fhash, page=page_display, block_type="text",
+                            heading_path=_heading_path(heading_stack), chunk_index=idx
+                        ))
+                        idx += 1
 
     doc.close()
     if plumber_doc:
@@ -825,31 +1145,62 @@ def _extract_docx_paragraph_images(element, word_doc) -> list[tuple[bytes, str]]
 def _docx_table_to_text(table) -> tuple[list[str], str]:
     """
     Word 表格 → (headers, table_text)
-    处理合并单元格：同一个 tc（表格单元格）对象只取一次，避免内容重复。
+    处理合并单元格：同一行内同一个 tc（表格单元格）对象只取一次，避免水平合并单元格内容重复。
+    注意：seen_tc 只在一行内有效，跨行不复用（python-docx 会复用 cell 对象）。
     """
     from docx.table import Table
-    seen_tc = set()
+    from docx.oxml.ns import qn
+
     grid: list[list[str]] = []
 
     for row in table.rows:
+        seen_tc: set[int] = set()  # 每行独立，修复跨行 cell 对象复用问题
         row_cells: list[str] = []
         for cell in row.cells:
             tc_id = id(cell._tc)
             if tc_id in seen_tc:
-                row_cells.append("")          # 合并格占位，保持列数一致
+                row_cells.append("")          # 水平合并格占位
             else:
                 seen_tc.add(tc_id)
-                row_cells.append(cell.text.strip())
-        # 跳过全空行
+                # 优先用 cell.text，但如果为空尝试直接读 XML
+                text = cell.text.strip()
+                if not text:
+                    texts = [t.text for t in cell._tc.iter(qn('w:t')) if t.text]
+                    text = "".join(texts).strip()
+                row_cells.append(text)
         if any(row_cells):
             grid.append(row_cells)
 
     if not grid:
         return [], ""
 
-    headers = grid[0]
+    headers = grid[0] if grid else []
     lines = [" | ".join(c for c in r) for r in grid]
     return headers, "\n".join(lines)
+
+
+def _docx_table_from_xml(table) -> list[list[str]]:
+    """
+    备用方案：直接从 XML 解析表格，绕过 python-docx 的 row/cell 抽象。
+    解决某些 Word 表格 row.cells 返回不完整的问题。
+    """
+    from docx.oxml.ns import qn
+    tbl = table._tbl
+    grid: list[list[str]] = []
+
+    # 获取所有行 <w:tr>
+    for tr in tbl.iter(qn('w:tr')):
+        row_cells: list[str] = []
+        # 获取行内所有单元格 <w:tc>
+        for tc in tr.iter(qn('w:tc')):
+            # 提取单元格内所有 <w:t> 文本
+            texts = [t.text for t in tc.iter(qn('w:t')) if t.text]
+            cell_text = "".join(texts).strip()
+            row_cells.append(cell_text)
+        if any(row_cells):
+            grid.append(row_cells)
+
+    return grid
 
 
 def parse_docx(file_path: str) -> list[Chunk]:
@@ -877,6 +1228,7 @@ def parse_docx(file_path: str) -> list[Chunk]:
     # 列表缓冲：连续列表项先收集，一起作为一个 text chunk
     list_buf: list[str] = []
     list_heading_path: str = ""
+    prev_para_text: str = ""   # 记录上一个段落，用于关联表格标题
 
     def _flush_list():
         nonlocal idx
@@ -905,7 +1257,7 @@ def parse_docx(file_path: str) -> list[Chunk]:
 
             # 嵌入图片 OCR
             for img_bytes, img_ext in _extract_docx_paragraph_images(element, word):
-                img_text = _ocr_bytes(img_bytes, img_ext)
+                img_text = _ocr_bytes(img_bytes, img_ext, filename=fname)
                 if img_text.strip():
                     _flush_list()
                     for t in smart_chunk_text(clean_text(img_text)):
@@ -954,6 +1306,8 @@ def parse_docx(file_path: str) -> list[Chunk]:
                         ))
                         idx += 1
 
+            prev_para_text = text  # 记录本段落，供下一个表格关联标题用
+
         elif tag == "tbl":
             from docx.table import Table
             _flush_list()
@@ -964,13 +1318,48 @@ def parse_docx(file_path: str) -> list[Chunk]:
             if not table_text.strip():
                 continue
             page_n = max(1, para_counter // PAGE_SIZE)
-            chunks.append(Chunk(
-                text=table_text, file_name=fname, file_path=file_path,
-                file_hash=fhash, page=page_n, block_type="table",
-                table_headers=headers, heading_path=_heading_path(heading_stack),
-                chunk_index=idx
-            ))
-            idx += 1
+
+            # 如果上一个段落看起来是表格标题（含"表"字或"Table"），拼到表格内容开头
+            _is_table_caption = bool(
+                prev_para_text and (
+                    re.search(r'表\s*\d', prev_para_text) or
+                    re.search(r'[Tt]able\s*\d', prev_para_text) or
+                    re.search(r'表\s*[一二三四五六七八九十百]', prev_para_text)
+                )
+            )
+            # 大表格使用滑动窗口切片，每块保留表头
+            header_line = " | ".join(headers) if headers else ""
+            data_rows = table_text.split("\n")[1:] if "\n" in table_text else []  # 去掉表头行
+
+            # 如果表格很大（超过 20 行），或者总长度超过 3000，启用滑动窗口
+            if len(data_rows) > 20 or len(table_text) > 3000:
+                window_size = 15  # 每块最多 15 行数据
+                step = 10         # 滑动步长
+                for i in range(0, len(data_rows), step):
+                    batch = data_rows[i:i + window_size]
+                    if not batch:
+                        continue
+                    chunk_text = f"[{prev_para_text}]\n" if _is_table_caption else ""
+                    if header_line:
+                        chunk_text += header_line + "\n"
+                    chunk_text += "\n".join(batch)
+                    chunks.append(Chunk(
+                        text=chunk_text, file_name=fname, file_path=file_path,
+                        file_hash=fhash, page=page_n, block_type="table",
+                        table_headers=headers, heading_path=_heading_path(heading_stack),
+                        chunk_index=idx
+                    ))
+                    idx += 1
+            else:
+                table_chunk_text = f"[{prev_para_text}]\n{table_text}" if _is_table_caption else table_text
+                chunks.append(Chunk(
+                    text=table_chunk_text, file_name=fname, file_path=file_path,
+                    file_hash=fhash, page=page_n, block_type="table",
+                    table_headers=headers, heading_path=_heading_path(heading_stack),
+                    chunk_index=idx
+                ))
+                idx += 1
+            prev_para_text = ""  # 标题已消费，清空
 
     _flush_list()  # 文档末尾可能还有未刷出的列表
     _print_chunks(chunks, f"Word · {fname}")
@@ -1108,7 +1497,7 @@ def parse_image(file_path: str) -> list[Chunk]:
     try:
         with open(file_path, "rb") as f:
             img_bytes = f.read()
-        text = _do_ocr(img_bytes)
+        text = _do_ocr(img_bytes, filename=fname)
         del img_bytes  # OCR 完立即释放
         import gc; gc.collect()
     except OCRUnavailableError:
