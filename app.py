@@ -1,9 +1,9 @@
 """
-app.py — RAG 知识库 API（基于 qwen3.5:9b）
+app.py — RAG 知识库 API（基于 LLM）
 
 接口：
   POST /api/ingest          上传文件 → 解析 → 向量化 → 入库（自动去重）
-  GET  /api/query           向量检索 + qwen3.5:9b 生成带来源标注的答案
+  GET  /api/query           向量检索 + LLM 生成带来源标注的答案
   GET  /api/search          纯向量检索（不走 LLM）
   GET  /api/files           已入库文件列表
   DELETE /api/files/{name}  删除文件
@@ -153,7 +153,7 @@ def _hits_to_citations(hits: list[dict]) -> list[Citation]:
 
 
 def _build_prompt(query: str, hits: list[dict]) -> str:
-    """构建带来源标注的 RAG Prompt，专门针对 qwen 系列模型优化"""
+    """构建带来源标注的 RAG Prompt，专门针对 LLM 系列模型优化"""
     context_parts = []
     for i, h in enumerate(hits):
         loc = f"文件：{h['file_name']} 第{h['page']}页"
@@ -188,7 +188,7 @@ def _build_prompt(query: str, hits: list[dict]) -> str:
 
 
 async def _call_ollama(prompt: str) -> str:
-    """调用 Ollama（qwen3.5:9b）生成答案"""
+    """调用 Ollama LLM 生成答案"""
     import httpx
     payload = {
         "model":  LLM_MODEL,
@@ -374,7 +374,7 @@ async def query(
             citations=[], llm_available=False
         )
 
-    # 调用 qwen3.5:9b
+    # 调用 LLM
     llm_ok = False
     answer = ""
     try:

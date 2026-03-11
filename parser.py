@@ -553,7 +553,13 @@ def _run_llm(img_bytes: bytes) -> str:
         method="POST",
     )
     with _urllib_req.urlopen(req, timeout=_LLM_OCR_TIMEOUT) as r:
-        return _json.loads(r.read()).get("response", "").strip()
+        text = _json.loads(r.read()).get("response", "").strip()
+    if text:
+        preview = text[:200] + ("..." if len(text) > 200 else "")
+        print(f"    📝 LLM OCR 识别结果（{len(text)}字）:\n{preview}")
+    else:
+        print(f"    ⚠️  LLM OCR 未识别到文字")
+    return text
 
 
 # 引擎名 → (可用标志, 执行函数)
