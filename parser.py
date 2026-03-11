@@ -18,6 +18,13 @@ import tempfile
 from dataclasses import dataclass, field
 from langchain_core.documents import Document
 
+# 加载 .env（app.py 已加载时这里是空操作，单独运行 parser.py 时有效）
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
 # ── 可选依赖检测 ──────────────────────────────────────────────
 
 try:
@@ -64,8 +71,10 @@ import base64 as _base64
 import urllib.request as _urllib_req
 import json as _json
 
-_OLLAMA_URL   = os.environ.get("OLLAMA_URL",  "http://localhost:11434")
-_VISION_MODEL = os.environ.get("LLM_MODEL",   "qwen3.5:9b")
+_OLLAMA_URL   = os.environ.get("OLLAMA_URL",   "http://localhost:11434")
+# OCR 专用 vision 模型，独立于问答模型（LLM_MODEL）
+# 需要支持图片输入，推荐: minicpm-v / llava:7b / llava:13b
+_VISION_MODEL = os.environ.get("LLM_OCR_MODEL", os.environ.get("LLM_MODEL", "minicpm-v"))
 _LLM_OCR_TIMEOUT = int(os.environ.get("LLM_OCR_TIMEOUT", "60"))
 _LLM_OCR_MAX_PX  = int(os.environ.get("LLM_OCR_MAX_PX",  "1024"))
 
@@ -338,9 +347,6 @@ def _preprocess_image(img):
     return img
 
 
-_paddle_init_failed = False   # 初始化失败后永久跳过，不重试
-
-
 # ── Paddle OCR（直接调用，模型已本地缓存）───────────────────
 _paddle_instance = None
 _paddle_init_failed = False
@@ -358,6 +364,7 @@ def _paddle_result_to_text(results) -> str:
             texts = data.get("rec_texts", [])
             boxes = data.get("rec_boxes", [])   # [x1,y1,x2,y2]
             if not texts:
+                del res
                 continue
 
             if not boxes or len(boxes) != len(texts):
@@ -417,13 +424,15 @@ def _paddle_result_to_text(results) -> str:
                 lines.append("  ".join(c for c in cells if c.strip()))
 
             result_text = "\n".join(l for l in lines if l.strip())
-            print(f"    📋 _paddle_result_to_text 输出前3行: {result_text.splitlines()[:3]}")
+            del res, data, texts, boxes, items, rows, lines
             return result_text
 
         except Exception:
             try:
                 texts = res.json.get("res", {}).get("rec_texts", [])
-                return "\n".join(t for t in texts if t.strip())
+                result = "\n".join(t for t in texts if t.strip())
+                del res
+                return result
             except Exception:
                 pass
     return ""
@@ -438,40 +447,62 @@ def _run_paddle(img_bytes: bytes) -> str:
     if _paddle_instance is None:
         try:
             try:
-                _paddle_instance = PaddleOCR(use_textline_orientation=True, lang="ch")
+                # 用 mobile 轻量模型，macOS CPU 上内存占用远低于 server 版
+                _paddle_instance = PaddleOCR(
+                    use_textline_orientation=True,
+                    lang="ch",
+                    ocr_version="PP-OCRv4",   # v4 mobile，比 v5 server 轻量很多
+                    cpu_threads=2,             # 限制 CPU 线程数
+                    enable_mkldnn=False,       # macOS 关闭 MKL-DNN 避免内存泄漏
+                )
             except TypeError:
-                _paddle_instance = PaddleOCR(use_angle_cls=True, lang="ch")
+                _paddle_instance = PaddleOCR(
+                    use_angle_cls=True,
+                    lang="ch",
+                    ocr_version="PP-OCRv4",
+                    cpu_threads=2,
+                    enable_mkldnn=False,
+                )
         except BaseException as e:
             _paddle_init_failed = True
             HAS_PADDLE = False
             raise RuntimeError(f"PaddleOCR 初始化失败: {e}") from e
 
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-        # 压缩到 3000px 以内，避免 Paddle 自动缩放影响识别精度
-        try:
-            img = Image.open(io.BytesIO(img_bytes))
-            w, h = img.size
-            max_px = 3000
-            if max(w, h) > max_px:
-                scale = max_px / max(w, h)
-                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-                print(f"    🖼  压缩图片: {w}x{h} → {img.size[0]}x{img.size[1]}")
-            img.save(f.name, format="JPEG", quality=95)
-        except Exception:
-            f.write(img_bytes)
-        tmp = f.name
+    tmp = None
     try:
-        results = list(_paddle_instance.predict(tmp))
-        return _paddle_result_to_text(results)
+        # 压缩图片到临时文件，用完立即释放原始字节
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            tmp = f.name
+            try:
+                img = Image.open(io.BytesIO(img_bytes))
+                w, h = img.size
+                max_px = 2000
+                if max(w, h) > max_px:
+                    scale = max_px / max(w, h)
+                    img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                    print(f"    🖼  压缩图片: {w}x{h} → {img.size[0]}x{img.size[1]}")
+                img.save(f.name, format="JPEG", quality=90)
+                img.close()
+                del img
+            except Exception:
+                f.write(img_bytes)
+        # 原始字节用完释放
+        del img_bytes
+
+        results = _paddle_instance.predict(tmp)   # 不 list()，保持生成器惰性求值
+        text = _paddle_result_to_text(results)
+        del results
+        return text
     except BaseException as e:
         _paddle_init_failed = True
         HAS_PADDLE = False
         raise RuntimeError(f"PaddleOCR 执行失败: {e}") from e
     finally:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
 
 
 
@@ -886,12 +917,15 @@ def parse_image(file_path: str) -> list[Chunk]:
     fhash = file_sha256(file_path)
     fname = os.path.basename(file_path)
 
-    if not HAS_PIL or not _has_any_ocr():
+    if not _has_any_ocr():
         raise OCRUnavailableError(fname)
 
     try:
-        img = Image.open(file_path)
-        text = _ocr_image_obj(img)
+        with open(file_path, "rb") as f:
+            img_bytes = f.read()
+        text = _do_ocr(img_bytes)
+        del img_bytes  # OCR 完立即释放
+        import gc; gc.collect()
     except OCRUnavailableError:
         raise
     except BaseException as e:
@@ -905,19 +939,10 @@ def parse_image(file_path: str) -> list[Chunk]:
     cleaned = clean_text_table(text) if _is_table_text(text) else clean_text(text)
 
     if _is_table_text(text):
-        print(f"    📊 检测到表格图片，整体入库（不切片）")
-        print(f"    📝 完整识别内容:\n{cleaned}\n    ── 内容结束 ──")
+        print(f"    📊 检测到铭牌/表格图片，整体入库（{len(cleaned)}字）")
         texts = [cleaned]
     else:
         texts = smart_chunk_text(cleaned)
-
-    return [
-        Chunk(
-            text=t, file_name=fname, file_path=file_path,
-            file_hash=fhash, page=1, block_type="image", chunk_index=i
-        )
-        for i, t in enumerate(texts) if t.strip()
-    ]
 
     return [
         Chunk(

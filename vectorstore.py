@@ -2,7 +2,7 @@
 vectorstore.py — Milvus 向量库 + SQLite 文件元数据管理
 
 字段设计：id、embedding、file_name、file_hash、page、block_type、
-          heading_path、heading_level、table_headers、chunk_index、text
+          heading_path、heading_level、table_headers、chunk_index、text、category
 """
 
 import sqlite3
@@ -41,12 +41,19 @@ def init_db(db_path: str = "rag_meta.db") -> sqlite3.Connection:
             file_path   TEXT NOT NULL,
             file_hash   TEXT NOT NULL UNIQUE,
             file_type   TEXT,
+            category    TEXT DEFAULT '',
             chunk_count INTEGER DEFAULT 0,
             status      TEXT DEFAULT 'pending',
             created_at  TEXT DEFAULT (datetime('now')),
             updated_at  TEXT DEFAULT (datetime('now'))
         )
     """)
+    # 兼容旧库：如果 category 列不存在则添加
+    try:
+        conn.execute("ALTER TABLE files ADD COLUMN category TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:
+        pass  # 列已存在，忽略
     conn.commit()
     return conn
 
@@ -59,23 +66,34 @@ def is_file_indexed(conn: sqlite3.Connection, file_hash: str) -> bool:
 
 
 def register_file(conn: sqlite3.Connection, file_name: str, file_path: str,
-                  file_hash: str, file_type: str, chunk_count: int):
+                  file_hash: str, file_type: str, chunk_count: int,
+                  category: str = ""):
     conn.execute("""
         INSERT OR REPLACE INTO files
-        (file_name, file_path, file_hash, file_type, chunk_count, status, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'indexed', datetime('now'))
-    """, (file_name, file_path, file_hash, file_type, chunk_count))
+        (file_name, file_path, file_hash, file_type, category, chunk_count, status, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'indexed', datetime('now'))
+    """, (file_name, file_path, file_hash, file_type, category, chunk_count))
     conn.commit()
 
 
 def list_indexed_files(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute("""
-        SELECT file_name, file_type, chunk_count, created_at
+        SELECT file_name, file_type, category, chunk_count, created_at
         FROM files WHERE status = 'indexed'
-        ORDER BY created_at DESC
+        ORDER BY category, created_at DESC
     """).fetchall()
-    return [{"file_name": r[0], "file_type": r[1],
-             "chunk_count": r[2], "indexed_at": r[3]} for r in rows]
+    return [{"file_name": r[0], "file_type": r[1], "category": r[2],
+             "chunk_count": r[3], "indexed_at": r[4]} for r in rows]
+
+
+def list_categories(conn: sqlite3.Connection) -> list[str]:
+    """返回所有已有分类（去重排序）"""
+    rows = conn.execute("""
+        SELECT DISTINCT category FROM files
+        WHERE status = 'indexed' AND category != ''
+        ORDER BY category
+    """).fetchall()
+    return [r[0] for r in rows]
 
 
 def delete_file_from_index(conn: sqlite3.Connection, file_hash: str):
@@ -105,6 +123,7 @@ def get_or_create_collection(collection_name: str = "rag_docs", dim: int = 768):
         FieldSchema("embedding",     DataType.FLOAT_VECTOR,  dim=dim),
         FieldSchema("file_name",     DataType.VARCHAR,       max_length=512),
         FieldSchema("file_hash",     DataType.VARCHAR,       max_length=64),
+        FieldSchema("category",      DataType.VARCHAR,       max_length=256),
         FieldSchema("page",          DataType.INT32),
         FieldSchema("block_type",    DataType.VARCHAR,       max_length=32),
         FieldSchema("heading_path",  DataType.VARCHAR,       max_length=1024),
@@ -125,12 +144,13 @@ def get_or_create_collection(collection_name: str = "rag_docs", dim: int = 768):
     return col
 
 
-def insert_chunks(col, chunks_with_embeddings: list[tuple]) -> list[int]:
+def insert_chunks(col, chunks_with_embeddings: list[tuple],
+                  category: str = "") -> list[int]:
     if not chunks_with_embeddings:
         return []
 
     data = {k: [] for k in [
-        "embedding", "file_name", "file_hash", "page", "block_type",
+        "embedding", "file_name", "file_hash", "category", "page", "block_type",
         "heading_path", "heading_level", "table_headers", "chunk_index", "text"
     ]}
 
@@ -138,6 +158,7 @@ def insert_chunks(col, chunks_with_embeddings: list[tuple]) -> list[int]:
         data["embedding"].append(emb)
         data["file_name"].append(chunk.file_name[:512])
         data["file_hash"].append(chunk.file_hash[:64])
+        data["category"].append(category[:256])
         data["page"].append(chunk.page)
         data["block_type"].append(chunk.block_type[:32])
         data["heading_path"].append(chunk.heading_path[:1024])
@@ -152,15 +173,22 @@ def insert_chunks(col, chunks_with_embeddings: list[tuple]) -> list[int]:
 
 
 def vector_search(col, query_embedding: list[float], top_k: int = 20,
-                  file_filter: Optional[str] = None) -> list[dict]:
-    expr = f'file_name == "{file_filter}"' if file_filter else None
+                  file_filter: Optional[str] = None,
+                  category_filter: Optional[str] = None) -> list[dict]:
+    exprs = []
+    if file_filter:
+        exprs.append(f'file_name == "{file_filter}"')
+    if category_filter:
+        exprs.append(f'category == "{category_filter}"')
+    expr = " and ".join(exprs) if exprs else None
+
     results = col.search(
         data=[query_embedding],
         anns_field="embedding",
         param={"metric_type": "COSINE", "params": {"ef": 128}},
         limit=top_k,
         expr=expr,
-        output_fields=["file_name", "file_hash", "page", "block_type",
+        output_fields=["file_name", "file_hash", "category", "page", "block_type",
                         "heading_path", "table_headers", "chunk_index", "text"]
     )
     hits = []
@@ -171,6 +199,7 @@ def vector_search(col, query_embedding: list[float], top_k: int = 20,
             "score":         round(hit.score, 4),
             "file_name":     e.get("file_name", ""),
             "file_hash":     e.get("file_hash", ""),
+            "category":      e.get("category", ""),
             "page":          e.get("page", 1),
             "block_type":    e.get("block_type", "text"),
             "heading_path":  e.get("heading_path", ""),
@@ -187,9 +216,11 @@ def delete_by_file_hash(col, file_hash: str):
 
 
 def multi_stage_search(col, query: str, query_embedding: list[float],
-                       top_k: int = 5, file_filter: Optional[str] = None) -> list[dict]:
+                       top_k: int = 5, file_filter: Optional[str] = None,
+                       category_filter: Optional[str] = None) -> list[dict]:
     """向量粗排 → Reranker 精排（可选）"""
-    candidates = vector_search(col, query_embedding, top_k=top_k * 4, file_filter=file_filter)
+    candidates = vector_search(col, query_embedding, top_k=top_k * 4,
+                               file_filter=file_filter, category_filter=category_filter)
     if not candidates:
         return []
 

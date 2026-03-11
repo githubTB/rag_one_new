@@ -537,8 +537,14 @@
           <div id="file-list"></div>
         </div>
 
-        <!-- Milvus 配置 -->
+        <!-- 分类 + Milvus 配置 -->
         <div>
+          <div class="section-label" style="margin-bottom:10px;">文件分类</div>
+          <div class="form-group" style="margin-bottom:10px;">
+            <label class="form-label">分类名称（留空则不分类）</label>
+            <input class="form-input" id="category-input" placeholder="例如：净化工程、水电气报表…" list="category-datalist" />
+            <datalist id="category-datalist"></datalist>
+          </div>
           <div class="section-label" style="margin-bottom:10px;">Milvus 配置</div>
           <div class="config-grid">
             <div class="form-group">
@@ -561,7 +567,7 @@
           </button>
         </div>
 
-        <!-- 已入库文件 -->
+        <!-- 已入库文件（按分类分组） -->
         <div>
           <div class="section-label" style="margin-bottom:10px;">已入库文件</div>
           <div id="indexed-files" style="font-size:0.8rem;color:var(--ink-muted);">
@@ -590,6 +596,10 @@
             <option value="3">3</option>
             <option value="5" selected>5</option>
             <option value="10">10</option>
+          </select>
+          <label>限定分类：</label>
+          <select id="category-filter">
+            <option value="">全部分类</option>
           </select>
           <label>限定文件：</label>
           <select id="file-filter">
@@ -677,15 +687,20 @@ async function fetchHealth() {
 function showHealth() {
   const d = healthData;
   const rows = [
-    ['状态',    d.status === 'ok' ? '<span class="ok">正常</span>' : '<span class="fail">部分不可用</span>'],
-    ['LLM 模型', d.llm_model  || '-'],
-    ['LLM 连通', d.llm_reachable ? '<span class="ok">✓ 可用</span>' : '<span class="fail">✗ 不可用</span>'],
-    ['Milvus',  d.milvus      ? '<span class="ok">✓ 已连接</span>' : '<span class="fail">✗ 未连接</span>'],
-    ['Embedder',d.embedder    ? '<span class="ok">✓ 已加载</span>' : '<span class="fail">✗ 未加载</span>'],
-    ['Ollama',  d.llm_url     || '-'],
+    ['状态',         d.status === 'ok' ? '<span class="ok">正常</span>' : '<span class="fail">部分不可用</span>'],
+    ['Milvus',       d.milvus      ? '<span class="ok">✓ 已连接</span>' : '<span class="fail">✗ 未连接</span>'],
+    ['Ollama 地址',  d.llm_url     || '-'],
+    ['Ollama 连通',  d.llm_reachable ? '<span class="ok">✓ 可用</span>' : '<span class="fail">✗ 不可用</span>'],
+    ['─────────', '─────────────────'],
+    ['向量化模型',   d.embed_model  || '-'],
+    ['OCR 模型',     d.llm_ocr_model || '-'],
+    ['对话模型',     d.llm_model    || '-'],
   ];
   document.getElementById('health-details').innerHTML =
-    rows.map(([k,v]) => `<div class="health-row"><span class="key">${k}</span><span class="val">${v}</span></div>`).join('');
+    rows.map(([k, v]) => k.startsWith('─')
+      ? `<div style="border-bottom:1px solid var(--border);margin:4px 0;"></div>`
+      : `<div class="health-row"><span class="key">${k}</span><span class="val">${v}</span></div>`
+    ).join('');
   document.getElementById('health-modal').classList.add('open');
 }
 function closeHealth() {
@@ -751,6 +766,7 @@ document.getElementById('process-btn').addEventListener('click', async () => {
     uploadedFiles.forEach(f => fd.append('files', f));
     fd.append('milvus_host', document.getElementById('milvus-host').value);
     fd.append('milvus_port', document.getElementById('milvus-port').value);
+    fd.append('category', document.getElementById('category-input').value.trim());
 
     const r = await fetch('/api/ingest', { method: 'POST', body: fd });
     if (!r.ok) {
@@ -771,7 +787,6 @@ document.getElementById('process-btn').addEventListener('click', async () => {
     if (ocr.length)  msg += `  ⚠️ ${ocr.length} 个图片需安装 OCR`;
     fail.forEach(x => console.warn('[ingest fail]', x.file, x.reason));
 
-    // OCR 未安装：在页面显示安装指引卡片
     if (ocr.length) {
       const guide = ocr[0].reason || '';
       showOCRGuide(ocr.map(x => x.file), guide);
@@ -790,14 +805,27 @@ document.getElementById('process-btn').addEventListener('click', async () => {
 });
 
 // ─────────────────────────────────────────────
-// 已入库文件列表
+// 已入库文件列表（按分类分组）
 // ─────────────────────────────────────────────
 async function loadIndexedFiles() {
   try {
-    const r = await fetch('/api/files');
-    const d = await r.json();
-    const el = document.getElementById('indexed-files');
+    const [filesResp, catsResp] = await Promise.all([
+      fetch('/api/files'),
+      fetch('/api/categories'),
+    ]);
+    const d = await filesResp.json();
+    const cats = (await catsResp.json()).categories || [];
+
+    const el  = document.getElementById('indexed-files');
     const sel = document.getElementById('file-filter');
+    const catSel = document.getElementById('category-filter');
+    const catDatalist = document.getElementById('category-datalist');
+    const catInput = document.getElementById('category-input');
+
+    // 更新分类下拉 & datalist
+    catSel.innerHTML = '<option value="">全部分类</option>' +
+      cats.map(c => `<option value="${c}">${c}</option>`).join('');
+    catDatalist.innerHTML = cats.map(c => `<option value="${c}">`).join('');
 
     if (!d.files || !d.files.length) {
       el.textContent = '暂无已入库文件';
@@ -805,10 +833,29 @@ async function loadIndexedFiles() {
       return;
     }
 
-    el.innerHTML = d.files.map(f => `
-      <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border);">
-        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;" title="${f.file_name}">${f.file_name}</span>
-        <span style="color:var(--ink-muted);font-size:0.72rem;font-family:'JetBrains Mono',monospace;">${f.chunk_count}c</span>
+    // 按分类分组
+    const groups = {};
+    d.files.forEach(f => {
+      const cat = f.category || '（未分类）';
+      if (!groups[cat]) groups[cat] = [];
+      groups[cat].push(f);
+    });
+
+    el.innerHTML = Object.entries(groups).map(([cat, files]) => `
+      <div style="margin-bottom:10px;">
+        <div style="font-size:0.72rem;font-weight:600;color:var(--accent);
+                    padding:3px 0;border-bottom:1px solid var(--border);margin-bottom:4px;">
+          📁 ${cat}
+        </div>
+        ${files.map(f => `
+          <div style="display:flex;justify-content:space-between;align-items:center;
+                      padding:4px 0 4px 8px;">
+            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+                         max-width:160px;font-size:0.78rem;" title="${f.file_name}">${f.file_name}</span>
+            <span style="color:var(--ink-muted);font-size:0.72rem;
+                         font-family:'JetBrains Mono',monospace;">${f.chunk_count}c</span>
+          </div>
+        `).join('')}
       </div>
     `).join('');
 
@@ -861,9 +908,10 @@ async function handleSearch() {
   const q = document.getElementById('query-input').value.trim();
   if (!q) { toast('请输入问题', 'warning'); return; }
 
-  const topK   = document.getElementById('top-k').value;
-  const filter = document.getElementById('file-filter').value;
-  const btn    = document.getElementById('search-btn');
+  const topK      = document.getElementById('top-k').value;
+  const filter    = document.getElementById('file-filter').value;
+  const catFilter = document.getElementById('category-filter').value;
+  const btn       = document.getElementById('search-btn');
 
   btn.disabled = true;
   btn.innerHTML = '<span class="spin">🔍</span> 搜索中…';
@@ -873,7 +921,8 @@ async function handleSearch() {
 
   try {
     let url = `/api/query?q=${encodeURIComponent(q)}&top_k=${topK}`;
-    if (filter) url += `&file_name=${encodeURIComponent(filter)}`;
+    if (filter)    url += `&file_name=${encodeURIComponent(filter)}`;
+    if (catFilter) url += `&category=${encodeURIComponent(catFilter)}`;
 
     const r = await fetch(url);
     if (!r.ok) {
@@ -913,6 +962,7 @@ async function handleSearch() {
           <div class="result-top">
             <div class="result-num">${c.id}</div>
             <div class="result-meta">
+              ${c.category ? `<span style="font-size:0.7rem;background:rgba(92,107,192,0.1);color:var(--accent);padding:1px 6px;border-radius:4px;margin-right:4px;">📁 ${c.category}</span>` : ''}
               <span class="fname">${c.file_name}</span>
               第 ${c.page} 页
               ${BLOCK_TAG[c.block_type] || ''}

@@ -1,9 +1,9 @@
 """
-app.py — RAG 知识库 API（基于 qwen3.5:2b）
+app.py — RAG 知识库 API（基于 qwen3.5:9b）
 
 接口：
   POST /api/ingest          上传文件 → 解析 → 向量化 → 入库（自动去重）
-  GET  /api/query           向量检索 + qwen3.5:2b 生成带来源标注的答案
+  GET  /api/query           向量检索 + qwen3.5:9b 生成带来源标注的答案
   GET  /api/search          纯向量检索（不走 LLM）
   GET  /api/files           已入库文件列表
   DELETE /api/files/{name}  删除文件
@@ -12,6 +12,15 @@ app.py — RAG 知识库 API（基于 qwen3.5:2b）
 
 import os
 import warnings
+
+# ── 最先加载 .env，让所有后续 os.environ.get() 都能读到 ──────
+from dotenv import load_dotenv
+import pathlib
+
+# 优先读 .env，不存在时自动降级读 .env.example
+_env_file = ".env" if pathlib.Path(".env").exists() else ".env.example"
+load_dotenv(_env_file, override=False)
+print(f"📋 加载配置文件: {_env_file}")
 
 # 关闭 PaddleOCR 启动时的联网模型源检查（加速启动，离线也能用）
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
@@ -37,7 +46,7 @@ from embedder import get_embedder
 from parser import parse_file, file_sha256, Chunk, HAS_PADDLE, HAS_TESSERACT, OCRUnavailableError
 from vectorstore import (
     init_db, is_file_indexed, register_file, list_indexed_files,
-    delete_file_from_index, connect_milvus, get_or_create_collection,
+    list_categories, delete_file_from_index, connect_milvus, get_or_create_collection,
     insert_chunks, multi_stage_search, delete_by_file_hash
 )
 
@@ -47,7 +56,8 @@ DB_PATH     = os.getenv("DB_PATH",     "rag_meta.db")
 MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 OLLAMA_URL  = os.getenv("OLLAMA_URL",  "http://localhost:11434")
-LLM_MODEL   = os.getenv("LLM_MODEL",   "qwen3.5:2b")   # ← 主力模型
+LLM_MODEL   = os.getenv("LLM_MODEL",   "qwen3.5:2b")   # 问答模型
+LLM_OCR_MODEL = os.getenv("LLM_OCR_MODEL", "minicpm-v")  # OCR 专用 vision 模型
 COLLECTION  = os.getenv("COLLECTION",  "rag_docs")
 
 # LLM 生成参数
@@ -70,6 +80,7 @@ embedder   = None
 async def startup():
     global db_conn, milvus_col, embedder
     logger.info("🚀 启动 RAG 服务...")
+    logger.info(f"📝 问答模型: {LLM_MODEL}  |  🖼  OCR 模型: {LLM_OCR_MODEL}")
 
     db_conn  = init_db(DB_PATH)
     logger.info("✅ SQLite 元数据库已初始化")
@@ -89,6 +100,7 @@ async def startup():
 class Citation(BaseModel):
     id: int
     file_name: str
+    category: str
     page: int
     block_type: str
     heading_path: str
@@ -129,6 +141,7 @@ def _hits_to_citations(hits: list[dict]) -> list[Citation]:
         Citation(
             id=i + 1,
             file_name=h["file_name"],
+            category=h.get("category", ""),
             page=h["page"],
             block_type=h["block_type"],
             heading_path=h["heading_path"],
@@ -144,14 +157,22 @@ def _build_prompt(query: str, hits: list[dict]) -> str:
     context_parts = []
     for i, h in enumerate(hits):
         loc = f"文件：{h['file_name']} 第{h['page']}页"
+        if h.get("category"):
+            loc = f"分类：{h['category']} / {loc}"
         if h["heading_path"]:
             loc += f" / {h['heading_path']}"
         context_parts.append(f"[来源{i + 1}] {loc}\n{h['text']}")
 
     context = "\n\n---\n\n".join(context_parts)
 
-    return f"""你是一个专业的知识库问答助手。请严格基于以下参考资料回答用户问题。
+    # 提取本次涉及的分类列表，提示 AI 注意边界
+    categories = list(dict.fromkeys(h["category"] for h in hits if h.get("category")))
+    category_hint = ""
+    if categories:
+        category_hint = f"\n注意：以下参考资料来自【{'、'.join(categories)}】分类，回答时请结合分类背景作答，不要混淆不同分类的内容。\n"
 
+    return f"""你是一个专业的知识库问答助手。请严格基于以下参考资料回答用户问题。
+{category_hint}
 要求：
 1. 每引用某条来源的内容时，在句末用 [来源N] 标注（N 为来源编号）
 2. 若参考资料中没有相关信息，明确回答"参考资料中未找到相关信息"，不要编造
@@ -167,7 +188,7 @@ def _build_prompt(query: str, hits: list[dict]) -> str:
 
 
 async def _call_ollama(prompt: str) -> str:
-    """调用 Ollama（qwen3.5:2b）生成答案"""
+    """调用 Ollama（qwen3.5:9b）生成答案"""
     import httpx
     payload = {
         "model":  LLM_MODEL,
@@ -191,6 +212,7 @@ async def ingest_files(
     files: list[UploadFile] = File(...),
     milvus_host: str = Form(default=None),
     milvus_port: str = Form(default=None),
+    category: str = Form(default=""),
 ):
     """上传文件，解析 → 向量化 → 入库 Milvus（按内容哈希去重）"""
     global milvus_col
@@ -236,11 +258,11 @@ async def ingest_files(
                 normalize_embeddings=True
             ).tolist()
 
-            insert_chunks(milvus_col, list(zip(chunks, embeddings_list)))
+            insert_chunks(milvus_col, list(zip(chunks, embeddings_list)), category=category)
 
             ext_label = os.path.splitext(upload.filename)[1].upper().lstrip(".")
             register_file(db_conn, upload.filename, save_path, fhash,
-                          ext_label, len(chunks))
+                          ext_label, len(chunks), category=category)
 
             logger.info(f"✅ 入库成功: {upload.filename} ({len(chunks)} chunks)")
             results.append({
@@ -281,20 +303,70 @@ async def ingest_files(
     return {"results": results}
 
 
+async def _detect_category(q: str, categories: list[str]) -> Optional[str]:
+    """用 LLM 判断问题属于哪个分类，返回分类名或 None（跨分类/无法判断）"""
+    if not categories:
+        return None
+    if len(categories) == 1:
+        return categories[0]   # 只有一个分类，直接用
+    import httpx
+    cats_str = "、".join(f'"{c}"' for c in categories)
+    prompt = (
+        f"知识库中有以下分类：{cats_str}。\n"
+        f"用户问题：「{q}」\n"
+        f"请判断这个问题最可能属于哪个分类？\n"
+        f"只输出分类名称本身，不要任何解释。"
+        f"如果无法判断或问题跨多个分类，输出「全部」。"
+    )
+    try:
+        payload = {
+            "model": LLM_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0, "num_predict": 32},
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
+            r.raise_for_status()
+            result = r.json().get("response", "").strip().strip('"').strip()
+        if result in categories:
+            logger.info(f"🗂  自动路由到分类: {result}")
+            return result
+        if "全部" in result or "无法" in result:
+            return None
+        # 模糊匹配
+        for c in categories:
+            if c in result or result in c:
+                logger.info(f"🗂  模糊匹配分类: {c}")
+                return c
+    except Exception as e:
+        logger.warning(f"分类识别失败，使用全库检索: {e}")
+    return None
+
+
 @app.get("/api/query", response_model=QueryResponse)
 async def query(
     q: str = Query(..., description="问题"),
     top_k: int = Query(5, ge=1, le=20),
     file_name: Optional[str] = Query(None, description="限定文件名检索"),
+    category: Optional[str] = Query(None, description="手动限定分类（留空则自动路由）"),
 ):
-    """
-    RAG 问答：向量检索 → 构建 Prompt → qwen3.5:2b 生成答案
-    返回答案 + 结构化 citations
-    """
     _ensure_milvus()
-
     q_emb = embedder.encode(q, normalize_embeddings=True).tolist()
-    hits = multi_stage_search(milvus_col, q, q_emb, top_k=top_k, file_filter=file_name)
+
+    # 自动分类路由：手动指定分类时直接用，否则让 LLM 判断
+    resolved_category = category
+    if not resolved_category:
+        all_cats = list_categories(db_conn)
+        resolved_category = await _detect_category(q, all_cats)
+
+    hits = multi_stage_search(milvus_col, q, q_emb, top_k=top_k,
+                              file_filter=file_name, category_filter=resolved_category)
+
+    # 如果限定分类后没结果，降级到全库检索
+    if not hits and resolved_category:
+        logger.info(f"分类 '{resolved_category}' 无结果，降级全库检索")
+        hits = multi_stage_search(milvus_col, q, q_emb, top_k=top_k, file_filter=file_name)
 
     if not hits:
         return QueryResponse(
@@ -302,7 +374,7 @@ async def query(
             citations=[], llm_available=False
         )
 
-    # 调用 qwen3.5:2b
+    # 调用 qwen3.5:9b
     llm_ok = False
     answer = ""
     try:
@@ -330,12 +402,20 @@ async def search(
     q: str = Query(...),
     top_k: int = Query(5, ge=1, le=20),
     file_name: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
 ):
     """纯向量检索（不走 LLM），返回带溯源信息的结果"""
     _ensure_milvus()
     q_emb = embedder.encode(q, normalize_embeddings=True).tolist()
-    hits = multi_stage_search(milvus_col, q, q_emb, top_k=top_k, file_filter=file_name)
+    hits = multi_stage_search(milvus_col, q, q_emb, top_k=top_k,
+                              file_filter=file_name, category_filter=category)
     return SearchResponse(query=q, results=_hits_to_citations(hits))
+
+
+@app.get("/api/categories")
+async def get_categories():
+    """返回所有已有分类列表"""
+    return {"categories": list_categories(db_conn)}
 
 
 @app.get("/api/files")
@@ -388,6 +468,7 @@ async def drop_collection():
 @app.get("/api/health")
 async def health():
     """服务健康检查，包含 LLM 连通性探测"""
+    from embedder import MODEL_NAME as EMBED_MODEL_NAME
     milvus_ok = milvus_col is not None
     llm_reachable = False
     try:
@@ -402,7 +483,9 @@ async def health():
         "status":        "ok" if (milvus_ok and llm_reachable) else "degraded",
         "milvus":        milvus_ok,
         "embedder":      embedder is not None,
+        "embed_model":   EMBED_MODEL_NAME,
         "llm_url":       OLLAMA_URL,
+        "llm_ocr_model": LLM_OCR_MODEL,
         "llm_model":     LLM_MODEL,
         "llm_reachable": llm_reachable,
     }
