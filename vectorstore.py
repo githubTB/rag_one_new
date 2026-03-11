@@ -315,13 +315,70 @@ def multi_stage_search(col, query: str, query_embedding: list[float],
             scores = reranker.predict(pairs)
             for i, c in enumerate(candidates):
                 c["rerank_score"] = float(scores[i])
+
+            # 关键词精确命中的 chunk 设保底 rerank 分，防止被 Reranker 错误压低
+            # 保底值 = 当前最高分 * 0.85，确保精确命中的 chunk 不被排到截断线外
+            kw_hits_idx = [i for i, c in enumerate(candidates) if c.get("kw_score", 0) >= 0.5]
+            if kw_hits_idx:
+                max_score = max(c["rerank_score"] for c in candidates)
+                floor = max_score * 0.85
+                for i in kw_hits_idx:
+                    if candidates[i]["rerank_score"] < floor:
+                        candidates[i]["rerank_score"] = floor
+                        print(f"    📌 关键词命中保底: chunk '{candidates[i]['text'][:40]}...' rerank提升到{floor:.3f}")
+
             candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
         except Exception as e:
             print(f"⚠️  Reranker 精排失败，降级融合分: {e}")
             candidates.sort(key=lambda x: x["score"] * 0.7 + x.get("kw_score", 0) * 0.3, reverse=True)
     else:
-        # 向量分 0.7 + 关键词分 0.3 融合
-        candidates.sort(key=lambda x: x["score"] * 0.7 + x.get("kw_score", 0) * 0.3, reverse=True)
+        # 关键词精确命中（kw_score=1.0）优先，再按向量分排
+        candidates.sort(
+            key=lambda x: (x.get("kw_score", 0) >= 1.0,
+                           x["score"] * 0.6 + x.get("kw_score", 0) * 0.4),
+            reverse=True
+        )
 
     # 严格按 top_k 截断
     return candidates[:top_k]
+
+
+# ── 统一检索入口（兼容 app.py 里的 smart_search 调用）────────
+
+def smart_search(col, query: str, query_embedding: list[float],
+                 top_k: int = 5, file_filter: Optional[str] = None,
+                 category_filter: Optional[str] = None) -> tuple[list[dict], str]:
+    """
+    统一检索入口，返回 (hits, search_mode)。
+
+    list 类查询（含"所有/全部/有哪些"等）适当扩大候选数，
+    但无论如何严格截断到 top_k，不把大量噪音送给 LLM。
+
+    search_mode: vector | hybrid | rerank | list_* | empty
+    """
+    LIST_KEYWORDS = {"所有", "全部", "清单", "列表", "汇总", "统计", "有哪些"}
+    is_list_query = any(kw in query for kw in LIST_KEYWORDS)
+
+    # list 查询最多扩到 top_k*2，上限 20
+    effective_top_k = min(top_k * 2, 20) if is_list_query else top_k
+
+    hits = multi_stage_search(
+        col, query, query_embedding,
+        top_k=effective_top_k,
+        file_filter=file_filter,
+        category_filter=category_filter,
+    )
+
+    if not hits:
+        mode = "empty"
+    elif get_reranker():
+        mode = "rerank"
+    elif any(h.get("kw_score", 0) > 0 for h in hits):
+        mode = "hybrid"
+    else:
+        mode = "vector"
+
+    if is_list_query:
+        mode = f"list_{mode}"
+
+    return hits, mode
