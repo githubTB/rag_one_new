@@ -234,24 +234,107 @@ def clean_text_table(text: str) -> str:
     return text.strip()
 
 
-def detect_heading_level(text: str, style_name: str = "") -> int:
-    """返回标题级别（1-6），0 表示非标题"""
+def _get_para_visual_features(para) -> tuple[float, bool]:
+    """获取段落的视觉特征: (平均字号, 是否加粗)"""
+    sizes, bolds = [], []
+    for run in para.runs:
+        if run.text.strip():
+            sizes.append(run.font.size.pt if run.font.size else 12)
+            bolds.append(run.bold or (run.font.bold if run.font else False))
+    avg_size = sum(sizes) / len(sizes) if sizes else 12
+    is_bold = sum(bolds) / len(bolds) > 0.5 if bolds else False
+    return avg_size, is_bold
+
+
+def _is_likely_heading(text: str) -> tuple[bool, int]:
+    """
+    轻量级文本启发式判断 (是否标题, 级别)
+    仅作为最后一道兜底，不依赖复杂正则
+    """
+    if not text or len(text) > 80 or len(text) < 4:
+        return False, 0
+
+    # 简单启发式：短行 + 编号前缀（如 1. / 1.1. / 一、）+ 无冒号
+    if ':' in text or '：' in text:
+        return False, 0
+
+    # 检查是否有层级编号特征
+    if re.match(r'^\d+\.\d+\.\d+', text):  # 1.1.1
+        return True, 3
+    if re.match(r'^\d+\.\d+', text):       # 1.1
+        return True, 2
+    if re.match(r'^\d+[、\s]', text):      # 1、 或 1 后跟空格
+        return True, 2
+
+    return False, 0
+
+
+def detect_heading_level(text: str, style_name: str = "", para=None) -> int:
+    """
+    混合标题检测（按可靠性排序）：
+    1. Word 大纲级别 (outlineLvl，最底层可靠)
+    2. Word 样式名 (Heading 1/2/3)
+    3. 视觉特征 (字号显著大于正文)
+    4. 文本启发 (编号前缀，如 1.1.1，仅兜底)
+    """
+    # 前置过滤
+    if len(text) > 120:
+        return 0
+
+    # 调试：打印可疑段落
+    if text and len(text) < 50 and re.match(r'^[\d一二三四五六七八九十]', text):
+        print(f"   🔍 检测: '{text[:40]}' | style: {style_name}")
+
+    # 1. Word 大纲级别 (最可靠，比样式名更底层)
+    if para is not None:
+        try:
+            # 获取段落的大纲级别 (0-8, 0表示正文)
+            pPr = para._p.pPr
+            if pPr is not None:
+                outline_lvl = pPr.outlineLvl
+                if outline_lvl is not None:
+                    lvl = int(outline_lvl.val) + 1  # 0->1, 1->2, etc.
+                    return min(lvl, 6)
+        except Exception:
+            pass
+
+    # 2. Word 样式名
     if style_name:
         s = style_name.lower().replace(" ", "")
         m = re.match(r'heading(\d)', s) or re.match(r'标题(\d)', s)
         if m:
             return int(m.group(1))
-        if "title" in s:    return 1
-        if "subtitle" in s: return 2
+        if "title" in s:
+            return 1
 
+    # 3. 视觉特征 (需要正文作为基准)
+    if para is not None:
+        try:
+            avg_size, is_bold = _get_para_visual_features(para)
+            # 字号明显大于正文 或 加粗且字号较大
+            if avg_size >= 16 or (avg_size >= 14 and is_bold):
+                # 根据字号判断级别
+                if avg_size >= 18:
+                    return 1
+                elif avg_size >= 16:
+                    return 2
+                else:
+                    return 3
+        except Exception:
+            pass
+
+    # 3. 轻量级文本启发（仅作为兜底）
+    is_heading, level = _is_likely_heading(text)
+    if is_heading:
+        return level
+
+    # 4. 传统正则兜底
     if not text or len(text) > 120:
         return 0
-
-    if re.match(r'^第[一二三四五六七八九十百]+[章节部分]', text): return 1
-    if re.match(r'^[一二三四五六七八九十]+[、．.]', text):        return 2
-    if re.match(r'^\d+\.\d+\.\d+\s', text):                       return 3
-    if re.match(r'^\d+\.\d+\s', text):                             return 2
-    if re.match(r'^\d+[\.、]\s', text):                            return 2
+    if re.match(r'^第[一二三四五六七八九十百]+[章节部分]', text):
+        return 1
+    if re.match(r'^[一二三四五六七八九十]+[、．.]', text):
+        return 2
     return 0
 
 
@@ -270,6 +353,9 @@ def _print_chunks(chunks: list, source: str = "") -> None:
         if c.heading_path:
             loc += f" / {c.heading_path}"
         print(f"\n  {tag} chunk#{c.chunk_index}  [{c.block_type}]  {loc}")
+        # 打印完整内容，用缩进显示
+        content = c.text.replace('\n', '\n      ')
+        print(f"      内容: {content[:500]}{'...' if len(c.text) > 500 else ''}")
         print(f"  {'·' * 40}")
         for line in c.text.splitlines():
             print(f"  {line}")
@@ -1173,21 +1259,15 @@ def _extract_docx_paragraph_images(element, word_doc) -> list[tuple[bytes, str]]
 def _docx_table_to_text(table) -> tuple[list[str], str]:
     """
     Word 表格 → (headers, table_text)
-    处理合并单元格：同一个 tc（表格单元格）对象只取一次，避免内容重复。
+    简单直接：按行列遍历，不做任何去重（python-docx 已处理合并单元格）。
     """
-    from docx.table import Table
-    seen_tc = set()
     grid: list[list[str]] = []
 
-    for row in table.rows:
+    for row_idx, row in enumerate(table.rows):
         row_cells: list[str] = []
-        for cell in row.cells:
-            tc_id = id(cell._tc)
-            if tc_id in seen_tc:
-                row_cells.append("")          # 合并格占位，保持列数一致
-            else:
-                seen_tc.add(tc_id)
-                row_cells.append(cell.text.strip())
+        for col_idx, cell in enumerate(row.cells):
+            cell_text = cell.text.strip()
+            row_cells.append(cell_text)
         # 跳过全空行
         if any(row_cells):
             grid.append(row_cells)
@@ -1197,6 +1277,11 @@ def _docx_table_to_text(table) -> tuple[list[str], str]:
 
     headers = grid[0]
     lines = [" | ".join(c for c in r) for r in grid]
+    print(f"     表格解析完成: {len(grid)} 行 x {len(headers)} 列")
+    print(f"     第一行: {lines[0][:100]}")
+    if len(lines) > 1:
+        print(f"     第二行: {lines[1][:100]}")
+
     return headers, "\n".join(lines)
 
 
@@ -1253,8 +1338,13 @@ def parse_docx(file_path: str) -> list[Chunk]:
             page_n = max(1, para_counter // PAGE_SIZE)
 
             # 嵌入图片 OCR
-            for img_bytes, img_ext in _extract_docx_paragraph_images(element, word):
+            para_images = _extract_docx_paragraph_images(element, word)
+            if para_images:
+                print(f"   🖼  段落中发现 {len(para_images)} 张图片")
+            for img_bytes, img_ext in para_images:
+                print(f"   🖼  处理图片 ({len(img_bytes)} bytes, {img_ext})")
                 img_text = _ocr_bytes(img_bytes, img_ext, filename=fname)
+                print(f"   🖼  OCR结果: {img_text[:100]}..." if len(img_text) > 100 else f"   🖼  OCR结果: {img_text}")
                 if img_text.strip():
                     _flush_list()
                     for t in smart_chunk_text(clean_text(img_text)):
@@ -1271,7 +1361,14 @@ def parse_docx(file_path: str) -> list[Chunk]:
                 continue
 
             style = para.style.name if para.style else ""
-            level = detect_heading_level(text, style)
+
+            # 调试：打印所有短段落（看看有没有遗漏的标题）
+            if len(text) < 60:
+                print(f"   📄 para#{para_counter}: '{text[:50]}' | style: {style}")
+
+            level = detect_heading_level(text, style, para)
+            if level > 0:
+                print(f"   ✅ 标题识别成功: level={level}, text='{text[:40]}'")
 
             # ── 标题 ──
             if level > 0:
@@ -1307,12 +1404,18 @@ def parse_docx(file_path: str) -> list[Chunk]:
 
         elif tag == "tbl":
             from docx.table import Table
+            print(f"  🔍 发现表格元素，上一个段落: {prev_para_text[:50] if prev_para_text else '(无)'}")
             _flush_list()
             table = Table(element, word)
+            print(f"     表格行数: {len(table.rows)}")
             if not table.rows:
+                print("     ⚠️ 表格无行，跳过")
                 continue
             headers, table_text = _docx_table_to_text(table)
+            print(f"     解析结果 - headers: {headers}")
+            print(f"     table_text 前200字符: {table_text[:200]}")
             if not table_text.strip():
+                print("     ⚠️ 表格内容为空，跳过")
                 continue
             page_n = max(1, para_counter // PAGE_SIZE)
 
@@ -1324,7 +1427,9 @@ def parse_docx(file_path: str) -> list[Chunk]:
                     re.search(r'表\s*[一二三四五六七八九十百]', prev_para_text)
                 )
             )
+            print(f"     是否匹配表格标题: {_is_table_caption}")
             table_chunk_text = f"[{prev_para_text}]\n{table_text}" if _is_table_caption else table_text
+            print(f"     最终 chunk text 前200字符: {table_chunk_text[:200]}")
 
             chunks.append(Chunk(
                 text=table_chunk_text, file_name=fname, file_path=file_path,
@@ -1332,6 +1437,7 @@ def parse_docx(file_path: str) -> list[Chunk]:
                 table_headers=headers, heading_path=_heading_path(heading_stack),
                 chunk_index=idx
             ))
+            print(f"     ✅ 表格 chunk 已添加，index={idx}")
             idx += 1
             prev_para_text = ""  # 标题已消费，清空
 

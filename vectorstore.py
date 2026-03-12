@@ -9,6 +9,67 @@ import re
 import sqlite3
 from typing import Optional
 
+# ── jieba 分词（延迟加载）────────────────────────────────────────
+_jieba = None
+
+# 化工/报告类专业词，jieba 默认词典不含，需手动补充
+_DOMAIN_WORDS = [
+    "法人代表", "统一社会信用代码", "排污许可证", "营业执照",
+    "聚四氢呋喃", "1,4-丁二醇", "丁二醇", "乙炔", "甲醛", "甲醇",
+    "PTMEG", "BDO", "BYD", "BED", "THF", "NMP",
+    "碳排放", "碳中和", "碳达峰", "温室气体",
+    "绿色工厂", "清洁生产", "节能减排", "能源管理",
+    "危险废物", "固体废物", "废水处理", "排污口",
+    "环境影响评价", "竣工验收", "三同时",
+    "单位产品能耗", "综合能耗", "标准煤",
+]
+
+
+def _get_jieba():
+    """延迟加载 jieba，失败时静默回退到 re.split 模式"""
+    global _jieba
+    if _jieba is None:
+        try:
+            import jieba as _j
+            _j.setLogLevel("ERROR")
+            for w in _DOMAIN_WORDS:
+                _j.add_word(w)
+            _jieba = _j
+            print("✅ jieba 分词已加载")
+        except ImportError:
+            _jieba = "unavailable"
+            print("⚠️  jieba 未安装，关键词检索降级为 re.split 模式")
+    return None if _jieba == "unavailable" else _jieba
+
+
+def _tokenize(query: str) -> list[str]:
+    """
+    中文分词：优先用 jieba，不可用时退回 re.split。
+    返回过滤停用词后的有效关键词列表（按长度降序，最多 8 个）。
+    """
+    stop = {
+        "的", "了", "是", "在", "和", "与", "或", "有", "这", "那", "中", "为", "对",
+        "所有", "全部", "哪些", "什么", "请问", "告诉我", "查询", "列出", "列举",
+        "一下", "一些", "相关", "情况", "如何", "怎么", "是否", "有没有",
+    }
+    jb = _get_jieba()
+    if jb:
+        tokens = list(jb.cut(query.strip()))
+    else:
+        tokens = re.split(r"[\s，。！？；、,\.!?;]+", query.strip())
+
+    words = [t for t in tokens if len(t) >= 2 and t not in stop
+             and not re.match(r"^[\s\W]+$", t)]
+
+    seen: set = set()
+    result = []
+    for w in sorted(words, key=len, reverse=True):
+        if w not in seen:
+            seen.add(w)
+            result.append(w)
+    return result[:8]
+
+
 # ── Reranker（延迟加载）────────────────────────────────────────
 _reranker = None
 
@@ -220,36 +281,14 @@ def _keyword_search(col, query: str, top_k: int = 20,
                     file_filter: Optional[str] = None,
                     category_filter: Optional[str] = None) -> list[dict]:
     """
-    关键词兜底检索：把 query 拆成词，用 Milvus expr like 匹配 text 字段。
+    关键词兜底检索：用 jieba 分词后，Milvus expr like OR 匹配 text 字段。
     用于捕捉向量检索遗漏的精确词（人名、编号、专业术语等）。
     """
-    stop = {"的", "了", "是", "在", "和", "与", "或", "有", "这", "那", "中", "为", "对",
-            "所有", "全部", "哪些", "什么", "请问", "告诉我", "查询", "列出", "列举"}
-    # 先按标点切词
-    tokens = re.split(r'[\s，。！？；、,\.!?;]+', query.strip())
-    keywords = [t for t in tokens if len(t) >= 2 and t not in stop]
-
-    # 对较长 token（>=4字）额外产生 2-4 字 n-gram 子串
-    # 解决"所有法人代表"→无法匹配"法人代表"的问题
-    extra = []
-    for tok in list(keywords):
-        if len(tok) >= 4:
-            for n in (4, 3, 2):
-                for i in range(len(tok) - n + 1):
-                    sub = tok[i:i+n]
-                    if sub not in stop and sub not in keywords and sub not in extra:
-                        extra.append(sub)
-    # 去重，按长度降序，最多5个
-    seen: set = set()
-    dedup = []
-    for k in sorted(keywords + extra, key=len, reverse=True):
-        if k not in seen:
-            seen.add(k)
-            dedup.append(k)
-    keywords = dedup[:5]
-
+    keywords = _tokenize(query)
     if not keywords:
         return []
+    # Milvus like 最多用前 5 个关键词（避免 expr 过长）
+    kw_for_expr = keywords[:5]
 
     exprs = []
     if file_filter:
@@ -259,7 +298,7 @@ def _keyword_search(col, query: str, top_k: int = 20,
     # text 非空保护（避免 None 导致 BM25 报错）
     exprs.append('text != ""')
     # 每个关键词 OR 匹配
-    kw_expr = " or ".join(f'text like "%{kw}%"' for kw in keywords[:5])
+    kw_expr = " or ".join(f'text like "%{kw}%"' for kw in kw_for_expr)
     exprs.append(f"({kw_expr})")
     expr = " and ".join(exprs)
 
